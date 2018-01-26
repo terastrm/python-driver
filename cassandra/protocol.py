@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -331,6 +331,11 @@ class WriteFailureMessage(RequestExecutionException):
         return WriteFailure(self.summary_msg(), **self.info)
 
 
+class CDCWriteException(RequestExecutionException):
+    summary = 'Failed to execute write due to CDC space exhaustion.'
+    error_code = 0x1600
+
+
 class SyntaxException(RequestValidationException):
     summary = 'Syntax error in CQL query'
     error_code = 0x2000
@@ -389,6 +394,7 @@ class StartupMessage(_MessageType):
     KNOWN_OPTION_KEYS = set((
         'CQL_VERSION',
         'COMPRESSION',
+        'NO_COMPACT'
     ))
 
     def __init__(self, cqlversion, options):
@@ -507,6 +513,8 @@ _PAGE_SIZE_FLAG = 0x04
 _WITH_PAGING_STATE_FLAG = 0x08
 _WITH_SERIAL_CONSISTENCY_FLAG = 0x10
 _PROTOCOL_TIMESTAMP = 0x20
+_WITH_KEYSPACE_FLAG = 0x80
+_PREPARED_WITH_KEYSPACE_FLAG = 0x01
 
 
 class QueryMessage(_MessageType):
@@ -514,13 +522,14 @@ class QueryMessage(_MessageType):
     name = 'QUERY'
 
     def __init__(self, query, consistency_level, serial_consistency_level=None,
-                 fetch_size=None, paging_state=None, timestamp=None):
+                 fetch_size=None, paging_state=None, timestamp=None, keyspace=None):
         self.query = query
         self.consistency_level = consistency_level
         self.serial_consistency_level = serial_consistency_level
         self.fetch_size = fetch_size
         self.paging_state = paging_state
         self.timestamp = timestamp
+        self.keyspace = keyspace
         self._query_params = None  # only used internally. May be set to a list of native-encoded values to have them sent with the request.
 
     def send_body(self, f, protocol_version):
@@ -558,6 +567,14 @@ class QueryMessage(_MessageType):
         if self.timestamp is not None:
             flags |= _PROTOCOL_TIMESTAMP
 
+        if self.keyspace is not None:
+            if ProtocolVersion.uses_keyspace_flag(protocol_version):
+                flags |= _WITH_KEYSPACE_FLAG
+            else:
+                raise UnsupportedOperation(
+                    "Keyspaces may only be set on queries with protocol version "
+                    "5 or higher. Consider setting Cluster.protocol_version to 5.")
+
         if ProtocolVersion.uses_int_query_flags(protocol_version):
             write_uint(f, flags)
         else:
@@ -576,6 +593,8 @@ class QueryMessage(_MessageType):
             write_consistency_level(f, self.serial_consistency_level)
         if self.timestamp is not None:
             write_long(f, self.timestamp)
+        if self.keyspace is not None:
+            write_string(f, self.keyspace)
 
 
 CUSTOM_TYPE = object()
@@ -601,6 +620,7 @@ class ResultMessage(_MessageType):
     _FLAGS_GLOBAL_TABLES_SPEC = 0x0001
     _HAS_MORE_PAGES_FLAG = 0x0002
     _NO_METADATA_FLAG = 0x0004
+    _METADATA_ID_FLAG = 0x0008
 
     def __init__(self, kind, results, paging_state=None, col_types=None):
         self.kind = kind
@@ -616,7 +636,7 @@ class ResultMessage(_MessageType):
         if kind == RESULT_KIND_VOID:
             results = None
         elif kind == RESULT_KIND_ROWS:
-            paging_state, col_types, results = cls.recv_results_rows(
+            paging_state, col_types, results, result_metadata_id = cls.recv_results_rows(
                 f, protocol_version, user_type_map, result_metadata)
         elif kind == RESULT_KIND_SET_KEYSPACE:
             ksname = read_string(f)
@@ -631,7 +651,7 @@ class ResultMessage(_MessageType):
 
     @classmethod
     def recv_results_rows(cls, f, protocol_version, user_type_map, result_metadata):
-        paging_state, column_metadata = cls.recv_results_metadata(f, user_type_map)
+        paging_state, column_metadata, result_metadata_id = cls.recv_results_metadata(f, user_type_map)
         column_metadata = column_metadata or result_metadata
         rowcount = read_int(f)
         rows = [cls.recv_row(f, len(column_metadata)) for _ in range(rowcount)]
@@ -651,13 +671,17 @@ class ResultMessage(_MessageType):
                         raise DriverException('Failed decoding result column "%s" of type %s: %s' % (colnames[i],
                                                                                                      coltypes[i].cql_parameterized_type(),
                                                                                                      str(e)))
-        return paging_state, coltypes, (colnames, parsed_rows)
+        return paging_state, coltypes, (colnames, parsed_rows), result_metadata_id
 
     @classmethod
     def recv_results_prepared(cls, f, protocol_version, user_type_map):
         query_id = read_binary_string(f)
-        bind_metadata, pk_indexes, result_metadata = cls.recv_prepared_metadata(f, protocol_version, user_type_map)
-        return query_id, bind_metadata, pk_indexes, result_metadata
+        if ProtocolVersion.uses_prepared_metadata(protocol_version):
+            result_metadata_id = read_binary_string(f)
+        else:
+            result_metadata_id = None
+        bind_metadata, pk_indexes, result_metadata, _ = cls.recv_prepared_metadata(f, protocol_version, user_type_map)
+        return query_id, bind_metadata, pk_indexes, result_metadata, result_metadata_id
 
     @classmethod
     def recv_results_metadata(cls, f, user_type_map):
@@ -669,9 +693,14 @@ class ResultMessage(_MessageType):
         else:
             paging_state = None
 
+        if flags & cls._METADATA_ID_FLAG:
+            result_metadata_id = read_binary_string(f)
+        else:
+            result_metadata_id = None
+
         no_meta = bool(flags & cls._NO_METADATA_FLAG)
         if no_meta:
-            return paging_state, []
+            return paging_state, [], result_metadata_id
 
         glob_tblspec = bool(flags & cls._FLAGS_GLOBAL_TABLES_SPEC)
         if glob_tblspec:
@@ -688,7 +717,7 @@ class ResultMessage(_MessageType):
             colname = read_string(f)
             coltype = cls.read_type(f, user_type_map)
             column_metadata.append((colksname, colcfname, colname, coltype))
-        return paging_state, column_metadata
+        return paging_state, column_metadata, result_metadata_id
 
     @classmethod
     def recv_prepared_metadata(cls, f, protocol_version, user_type_map):
@@ -716,10 +745,10 @@ class ResultMessage(_MessageType):
             bind_metadata.append(ColumnMetadata(colksname, colcfname, colname, coltype))
 
         if protocol_version >= 2:
-            _, result_metadata = cls.recv_results_metadata(f, user_type_map)
-            return bind_metadata, pk_indexes, result_metadata
+            _, result_metadata, result_metadata_id = cls.recv_results_metadata(f, user_type_map)
+            return bind_metadata, pk_indexes, result_metadata, result_metadata_id
         else:
-            return bind_metadata, pk_indexes, None
+            return bind_metadata, pk_indexes, None, None
 
     @classmethod
     def recv_results_schema_change(cls, f, protocol_version):
@@ -768,14 +797,38 @@ class PrepareMessage(_MessageType):
     opcode = 0x09
     name = 'PREPARE'
 
-    def __init__(self, query):
+    def __init__(self, query, keyspace=None):
         self.query = query
+        self.keyspace = keyspace
 
     def send_body(self, f, protocol_version):
         write_longstring(f, self.query)
+
+        flags = 0x00
+
+        if self.keyspace is not None:
+            if ProtocolVersion.uses_keyspace_flag(protocol_version):
+                flags |= _PREPARED_WITH_KEYSPACE_FLAG
+            else:
+                raise UnsupportedOperation(
+                    "Keyspaces may only be set on queries with protocol version "
+                    "5 or higher. Consider setting Cluster.protocol_version to 5.")
+
         if ProtocolVersion.uses_prepare_flags(protocol_version):
-            # Write the flags byte; with 0 value for now, but this should change in PYTHON-678
-            write_uint(f, 0)
+            write_uint(f, flags)
+        else:
+            # checks above should prevent this, but just to be safe...
+            if flags:
+                raise UnsupportedOperation(
+                    "Attempted to set flags with value {flags:0=#8x} on"
+                    "protocol version {pv}, which doesn't support flags"
+                    "in prepared statements."
+                    "Consider setting Cluster.protocol_version to 5."
+                    "".format(flags=flags, pv=protocol_version))
+
+        if ProtocolVersion.uses_keyspace_flag(protocol_version):
+            if self.keyspace:
+                write_string(f, self.keyspace)
 
 
 class ExecuteMessage(_MessageType):
@@ -783,7 +836,8 @@ class ExecuteMessage(_MessageType):
     name = 'EXECUTE'
     def __init__(self, query_id, query_params, consistency_level,
                  serial_consistency_level=None, fetch_size=None,
-                 paging_state=None, timestamp=None, skip_meta=False):
+                 paging_state=None, timestamp=None, skip_meta=False,
+                 result_metadata_id=None):
         self.query_id = query_id
         self.query_params = query_params
         self.consistency_level = consistency_level
@@ -792,9 +846,12 @@ class ExecuteMessage(_MessageType):
         self.paging_state = paging_state
         self.timestamp = timestamp
         self.skip_meta = skip_meta
+        self.result_metadata_id = result_metadata_id
 
     def send_body(self, f, protocol_version):
         write_string(f, self.query_id)
+        if ProtocolVersion.uses_prepared_metadata(protocol_version):
+            write_string(f, self.result_metadata_id)
         if protocol_version == 1:
             if self.serial_consistency_level:
                 raise UnsupportedOperation(
@@ -852,12 +909,14 @@ class BatchMessage(_MessageType):
     name = 'BATCH'
 
     def __init__(self, batch_type, queries, consistency_level,
-                 serial_consistency_level=None, timestamp=None):
+                 serial_consistency_level=None, timestamp=None,
+                 keyspace=None):
         self.batch_type = batch_type
         self.queries = queries
         self.consistency_level = consistency_level
         self.serial_consistency_level = serial_consistency_level
         self.timestamp = timestamp
+        self.keyspace = keyspace
 
     def send_body(self, f, protocol_version):
         write_byte(f, self.batch_type.value)
@@ -881,6 +940,13 @@ class BatchMessage(_MessageType):
                 flags |= _WITH_SERIAL_CONSISTENCY_FLAG
             if self.timestamp is not None:
                 flags |= _PROTOCOL_TIMESTAMP
+            if self.keyspace:
+                if ProtocolVersion.uses_keyspace_flag(protocol_version):
+                    flags |= _WITH_KEYSPACE_FLAG
+                else:
+                    raise UnsupportedOperation(
+                        "Keyspaces may only be set on queries with protocol version "
+                        "5 or higher. Consider setting Cluster.protocol_version to 5.")
 
             if ProtocolVersion.uses_int_query_flags(protocol_version):
                 write_int(f, flags)
@@ -891,6 +957,10 @@ class BatchMessage(_MessageType):
                 write_consistency_level(f, self.serial_consistency_level)
             if self.timestamp is not None:
                 write_long(f, self.timestamp)
+
+            if ProtocolVersion.uses_keyspace_flag(protocol_version):
+                if self.keyspace is not None:
+                    write_string(f, self.keyspace)
 
 
 known_event_types = frozenset((

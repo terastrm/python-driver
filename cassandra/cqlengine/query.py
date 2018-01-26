@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ import time
 import six
 from warnings import warn
 
-from cassandra.query import SimpleStatement
+from cassandra.query import SimpleStatement, BatchType as CBatchType
 from cassandra.cqlengine import columns, CQLEngineException, ValidationError, UnicodeMixin
 from cassandra.cqlengine import connection as conn
 from cassandra.cqlengine.functions import Token, BaseQueryFunction, QueryValue
@@ -151,7 +151,7 @@ class BatchQuery(object):
                  timeout=conn.NOT_SET, connection=None):
         """
         :param batch_type: (optional) One of batch type values available through BatchType enum
-        :type batch_type: str or None
+        :type batch_type: BatchType, str or None
         :param timestamp: (optional) A datetime or timedelta object with desired timestamp to be applied
             to the batch conditional.
         :type timestamp: datetime or timedelta or None
@@ -225,7 +225,8 @@ class BatchQuery(object):
             self._execute_callbacks()
             return
 
-        opener = 'BEGIN ' + (self.batch_type + ' ' if self.batch_type else '') + ' BATCH'
+        batch_type = None if self.batch_type is CBatchType.LOGGED else self.batch_type
+        opener = 'BEGIN ' + (str(batch_type) + ' ' if batch_type else '') + ' BATCH'
         if self.timestamp:
 
             if isinstance(self.timestamp, six.integer_types):
@@ -355,9 +356,15 @@ class AbstractQuerySet(object):
         # because explicit is better than implicit
         self._limit = 10000
 
-        # see the defer and only methods
+        # We store the fields for which we use the Equal operator
+        # in a query, so we don't select it from the DB. _defer_fields
+        # will contain the names of the fields in the DB, not the names
+        # of the variables used by the mapper
         self._defer_fields = set()
         self._deferred_values = {}
+
+        # This variable will hold the names in the database of the fields
+        # for which we want to query
         self._only_fields = []
 
         self._values_list = False
@@ -526,6 +533,10 @@ class AbstractQuerySet(object):
         if isinstance(s, slice):
             start = s.start if s.start else 0
 
+            if start < 0 or (s.stop is not None and s.stop < 0):
+                warn("ModelQuerySet slicing with negative indices support will be removed in 4.0.",
+                     DeprecationWarning)
+
             # calculate the amount of results that need to be loaded
             end = s.stop
             if start < 0 or s.stop is None or s.stop < 0:
@@ -542,6 +553,10 @@ class AbstractQuerySet(object):
                 s = int(s)
             except (ValueError, TypeError):
                 raise TypeError('QuerySet indices must be integers')
+
+            if s < 0:
+                warn("ModelQuerySet indexing with negative indices support will be removed in 4.0.",
+                     DeprecationWarning)
 
             # Using negative indexing is costly since we have to execute a count()
             if s < 0:
@@ -719,7 +734,7 @@ class AbstractQuerySet(object):
             else:
                 query_val = column.to_database(val)
                 if not col_op:  # only equal values should be deferred
-                    clone._defer_fields.add(col_name)
+                    clone._defer_fields.add(column.db_field_name)
                     clone._deferred_values[column.db_field_name] = val  # map by db field name for substitution in results
 
             clone._where.append(WhereClause(column.db_field_name, operator, query_val, quote_field=quote_field))
@@ -941,6 +956,8 @@ class AbstractQuerySet(object):
                 "Can't resolve fields {0} in {1}".format(
                     ', '.join(missing_fields), self.model.__name__))
 
+        fields = [self.model._columns[field].db_field_name for field in fields]
+
         if action == 'defer':
             clone._defer_fields.update(fields)
         elif action == 'only':
@@ -1068,18 +1085,18 @@ class ModelQuerySet(AbstractQuerySet):
 
     def _select_fields(self):
         if self._defer_fields or self._only_fields:
-            fields = self.model._columns.keys()
+            fields = [columns.db_field_name for columns in self.model._columns.values()]
             if self._defer_fields:
                 fields = [f for f in fields if f not in self._defer_fields]
                 # select the partition keys if all model fields are set defer
                 if not fields:
-                    fields = self.model._partition_keys
+                    fields = [columns.db_field_name for columns in self.model._partition_keys.values()]
             if self._only_fields:
                 fields = [f for f in fields if f in self._only_fields]
             if not fields:
                 raise QueryException('No fields in select query. Only fields: "{0}", defer fields: "{1}"'.format(
                     ','.join(self._only_fields), ','.join(self._defer_fields)))
-            return [self.model._columns[f].db_field_name for f in fields]
+            return fields
         return super(ModelQuerySet, self)._select_fields()
 
     def _get_result_constructor(self):
@@ -1442,7 +1459,8 @@ class DMLQuery(object):
         nulled_fields = set()
         if self.instance._has_counter or self.instance._can_update():
             if self.instance._has_counter:
-                warn("'create' and 'save' actions on Counters are deprecated. A future version will disallow this. Use the 'update' mechanism instead.")
+                warn("'create' and 'save' actions on Counters are deprecated. It will be disallowed in 4.0. "
+                    "Use the 'update' mechanism instead.", DeprecationWarning)
             return self.update()
         else:
             insert = InsertStatement(self.column_family_name, ttl=self._ttl, timestamp=self._timestamp, if_not_exists=self._if_not_exists)

@@ -2,6 +2,9 @@ $env:JAVA_HOME="C:\Program Files\Java\jdk1.8.0"
 $env:PATH="$($env:JAVA_HOME)\bin;$($env:PATH)"
 $env:CCM_PATH="C:\Users\appveyor\ccm"
 $env:CASSANDRA_VERSION=$env:cassandra_version
+$env:EVENT_LOOP_MANAGER="asyncore"
+$env:SIMULACRON_JAR="C:\Users\appveyor\simulacron-standalone-0.7.0.jar"
+
 python --version
 python -c "import platform; print(platform.architecture())"
 # Install Ant
@@ -39,6 +42,13 @@ If (!(Test-Path $jce_indicator)) {
   Remove-Item $jcePolicyDir
 }
 
+# Download simulacron
+$simulacron_url = "https://github.com/datastax/simulacron/releases/download/0.7.0/simulacron-standalone-0.7.0.jar"
+$simulacron_jar = $env:SIMULACRON_JAR
+if(!(Test-Path $simulacron_jar)) {
+    (new-object System.Net.WebClient).DownloadFile($simulacron_url, $simulacron_jar)
+}
+
 # Install Python Dependencies for CCM.
 Start-Process python -ArgumentList "-m pip install psutil pyYaml six numpy" -Wait -NoNewWindow
 
@@ -57,9 +67,13 @@ $env:PYTHONPATH="$($env:CCM_PATH);$($env:PYTHONPATH)"
 $env:PATH="$($env:CCM_PATH);$($env:PATH)"
 
 # Predownload cassandra version for CCM if it isn't already downloaded.
+# This is necessary because otherwise ccm fails
 If (!(Test-Path C:\Users\appveyor\.ccm\repository\$env:cassandra_version)) {
   Start-Process python -ArgumentList "$($env:CCM_PATH)\ccm.py create -v $($env:cassandra_version) -n 1 predownload" -Wait -NoNewWindow
+  echo "Checking status of download"
+  python $env:CCM_PATH\ccm.py status
   Start-Process python -ArgumentList "$($env:CCM_PATH)\ccm.py remove predownload" -Wait -NoNewWindow
+  echo "Downloaded version $env:cassandra_version"
 }
 
 Start-Process python -ArgumentList "-m pip install -r test-requirements.txt" -Wait -NoNewWindow

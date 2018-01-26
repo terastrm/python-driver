@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,13 +27,13 @@ from cassandra.cluster import Cluster
 from cassandra.concurrent import execute_concurrent_with_args
 from cassandra.cqltypes import Int32Type, EMPTY
 from cassandra.query import dict_factory, ordered_dict_factory
-from cassandra.util import sortedset
+from cassandra.util import sortedset, Duration
 from tests.unit.cython.utils import cythontest
 
 from tests.integration import use_singledc, PROTOCOL_VERSION, execute_until_pass, notprotocolv1, \
-    BasicSharedKeyspaceUnitTestCase, greaterthancass21, lessthancass30
+    BasicSharedKeyspaceUnitTestCase, greaterthancass21, lessthancass30, greaterthanorequalcass3_10
 from tests.integration.datatype_utils import update_datatypes, PRIMITIVE_DATATYPES, COLLECTION_TYPES, PRIMITIVE_DATATYPES_KEYS, \
-    get_sample, get_collection_sample
+    get_sample, get_all_samples, get_collection_sample
 
 
 def setup_module():
@@ -161,8 +161,30 @@ class TypeTests(BasicSharedKeyspaceUnitTestCase):
         for expected, actual in zip(params, results):
             self.assertEqual(actual, expected)
 
+        # try the same thing sending one insert at the time
+        s.execute("TRUNCATE alltypes;")
+        for i, datatype in enumerate(PRIMITIVE_DATATYPES):
+            single_col_name = chr(start_index + i)
+            single_col_names = ["zz", single_col_name]
+            placeholders = ','.join(["%s"] * len(single_col_names))
+            single_columns_string = ', '.join(single_col_names)
+            for j, data_sample in enumerate(get_all_samples(datatype)):
+                key = i + 1000 * j
+                single_params = (key, data_sample)
+                s.execute("INSERT INTO alltypes ({0}) VALUES ({1})".format(single_columns_string, placeholders),
+                          single_params)
+                # verify data
+                result = s.execute("SELECT {0} FROM alltypes WHERE zz=%s".format(single_columns_string), (key,))[0][1]
+                compare_value = data_sample
+                if six.PY3:
+                    import ipaddress
+                    if isinstance(data_sample, ipaddress.IPv4Address) or isinstance(data_sample, ipaddress.IPv6Address):
+                        compare_value = str(data_sample)
+                self.assertEqual(result, compare_value)
+
         # try the same thing with a prepared statement
         placeholders = ','.join(["?"] * len(col_names))
+        s.execute("TRUNCATE alltypes;")
         insert = s.prepare("INSERT INTO alltypes ({0}) VALUES ({1})".format(columns_string, placeholders))
         s.execute(insert.bind(params))
 
@@ -793,6 +815,55 @@ class TypeTests(BasicSharedKeyspaceUnitTestCase):
         finally:
             self.session.execute("DROP TABLE {0}".format(self.function_table_name))
 
+    @greaterthanorequalcass3_10
+    def test_smoke_duration_values(self):
+        """
+        Test to write several Duration values to the database and verify
+        they can be read correctly. The verify than an exception is arisen
+        if the value is too big
+
+        @since 3.10
+        @jira_ticket PYTHON-747
+        @expected_result the read value in C* matches the written one
+
+        @test_category data_types serialization
+        """
+        self.session.execute("""
+            CREATE TABLE duration_smoke (k int primary key, v duration)
+            """)
+        self.addCleanup(self.session.execute, "DROP TABLE duration_smoke")
+
+        prepared = self.session.prepare("""
+            INSERT INTO duration_smoke (k, v)
+            VALUES (?, ?)
+            """)
+
+        nanosecond_smoke_values = [0, -1, 1, 100, 1000, 1000000, 1000000000,
+                        10000000000000,-9223372036854775807, 9223372036854775807,
+                        int("7FFFFFFFFFFFFFFF", 16), int("-7FFFFFFFFFFFFFFF", 16)]
+        month_day_smoke_values = [0, -1, 1, 100, 1000, 1000000, 1000000000,
+                                  int("7FFFFFFF", 16), int("-7FFFFFFF", 16)]
+
+        for nanosecond_value in nanosecond_smoke_values:
+            for month_day_value in month_day_smoke_values:
+
+                # Must have the same sign
+                if (month_day_value <= 0) != (nanosecond_value <= 0):
+                    continue
+
+                self.session.execute(prepared, (1, Duration(month_day_value, month_day_value, nanosecond_value)))
+                results = self.session.execute("SELECT * FROM duration_smoke")
+
+                v = results[0][1]
+                self.assertEqual(Duration(month_day_value, month_day_value, nanosecond_value), v,
+                                 "Error encoding value {0},{0},{1}".format(month_day_value, nanosecond_value))
+
+        self.assertRaises(ValueError, self.session.execute, prepared,
+                          (1, Duration(0, 0, int("8FFFFFFFFFFFFFF0", 16))))
+        self.assertRaises(ValueError, self.session.execute, prepared,
+                          (1, Duration(0, int("8FFFFFFFFFFFFFF0", 16), 0)))
+        self.assertRaises(ValueError, self.session.execute, prepared,
+                          (1, Duration(int("8FFFFFFFFFFFFFF0", 16), 0, 0)))
 
 class TypeTestsProtocol(BasicSharedKeyspaceUnitTestCase):
 

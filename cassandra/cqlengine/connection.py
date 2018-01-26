@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -211,7 +211,6 @@ def unregister_connection(name):
         del _connections[DEFAULT_CONNECTION]
         cluster = None
         session = None
-        log.warning("Unregistering default connection '{0}'. Use set_default_connection to set a new one.".format(name))
 
     conn = _connections[name]
     if conn.cluster:
@@ -259,8 +258,7 @@ def default():
     except:
         pass
 
-    conn = register_connection('default', hosts=None, default=True)
-    conn.setup()
+    register_connection('default', hosts=None, default=True)
 
     log.debug("cqlengine connection initialized with default session to localhost")
 
@@ -337,7 +335,6 @@ def execute(query, params=None, consistency_level=None, timeout=NOT_SET, connect
         query = SimpleStatement(str(query), consistency_level=consistency_level, fetch_size=query.fetch_size)
     elif isinstance(query, six.string_types):
         query = SimpleStatement(query, consistency_level=consistency_level)
-
     log.debug(format_log_context(query.query_string, connection=connection))
 
     result = conn.session.execute(query, params, timeout=timeout)

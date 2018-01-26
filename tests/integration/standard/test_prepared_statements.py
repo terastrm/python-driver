@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,11 +21,17 @@ except ImportError:
     import unittest  # noqa
 from cassandra import InvalidRequest
 
-from cassandra import ConsistencyLevel
+from cassandra import ConsistencyLevel, ProtocolVersion
 from cassandra.cluster import Cluster
 from cassandra.query import PreparedStatement, UNSET_VALUE, tuple_factory
-from tests.integration import get_server_versions
+from tests.integration import (get_server_versions, greaterthanorequalcass40,
+                               set_default_beta_flag_true,
+                               BasicSharedKeyspaceUnitTestCase)
 
+import logging
+
+
+LOG = logging.getLogger(__name__)
 
 def setup_module():
     use_singledc()
@@ -38,7 +44,8 @@ class PreparedStatementTests(unittest.TestCase):
         cls.cass_version = get_server_versions()
 
     def setUp(self):
-        self.cluster = Cluster(metrics_enabled=True, protocol_version=PROTOCOL_VERSION)
+        self.cluster = Cluster(metrics_enabled=True, protocol_version=PROTOCOL_VERSION,
+                               allow_beta_protocol_version=True)
         self.session = self.cluster.connect()
 
     def tearDown(self):
@@ -390,8 +397,21 @@ class PreparedStatementTests(unittest.TestCase):
         with self.assertRaises(InvalidRequest):
             self.session.execute(prepared, [0])
 
-    # TODO revisit this test
-    @unittest.skip
+
+@greaterthanorequalcass40
+class PreparedStatementInvalidationTest(BasicSharedKeyspaceUnitTestCase):
+
+    def setUp(self):
+        self.table_name = "{}.prepared_statement_invalidation_test".format(self.keyspace_name)
+        self.session.execute("CREATE TABLE {} (a int PRIMARY KEY, b int, d int);".format(self.table_name))
+        self.session.execute("INSERT INTO {} (a, b, d) VALUES (1, 1, 1);".format(self.table_name))
+        self.session.execute("INSERT INTO {} (a, b, d) VALUES (2, 2, 2);".format(self.table_name))
+        self.session.execute("INSERT INTO {} (a, b, d) VALUES (3, 3, 3);".format(self.table_name))
+        self.session.execute("INSERT INTO {} (a, b, d) VALUES (4, 4, 4);".format(self.table_name))
+
+    def tearDown(self):
+        self.session.execute("DROP TABLE {}".format(self.table_name))
+
     def test_invalidated_result_metadata(self):
         """
         Tests to make sure cached metadata is updated when an invalidated prepared statement is reprepared.
@@ -402,29 +422,166 @@ class PreparedStatementTests(unittest.TestCase):
         Prior to this fix, the request would blow up with a protocol error when the result was decoded expecting a different
         number of columns.
         """
-        s = self.session
-        s.result_factory = tuple_factory
-
-        table = "test1rf.%s" % self._testMethodName.lower()
-
-        s.execute("DROP TABLE IF EXISTS %s" % table)
-        s.execute("CREATE TABLE %s (k int PRIMARY KEY, a int, b int, c int)" % table)
-        s.execute("INSERT INTO %s (k, a, b, c) VALUES (0, 0, 0, 0)" % table)
-
-        wildcard_prepared = s.prepare("SELECT * FROM %s" % table)
+        wildcard_prepared = self.session.prepare("SELECT * FROM {}".format(self.table_name))
         original_result_metadata = wildcard_prepared.result_metadata
-        self.assertEqual(len(original_result_metadata), 4)
+        self.assertEqual(len(original_result_metadata), 3)
 
-        r = s.execute(wildcard_prepared)
-        self.assertEqual(r[0], (0, 0, 0, 0))
+        r = self.session.execute(wildcard_prepared)
+        self.assertEqual(r[0], (1, 1, 1))
 
-        s.execute("ALTER TABLE %s DROP c" % table)
+        self.session.execute("ALTER TABLE {} DROP d".format(self.table_name))
 
         # Get a bunch of requests in the pipeline with varying states of result_meta, reprepare, resolved
-        futures = set(s.execute_async(wildcard_prepared.bind(None)) for _ in range(200))
+        futures = set(self.session.execute_async(wildcard_prepared.bind(None)) for _ in range(200))
         for f in futures:
+            self.assertEqual(f.result()[0], (1, 1))
 
-            self.assertEqual(f.result()[0], (0, 0, 0))
         self.assertIsNot(wildcard_prepared.result_metadata, original_result_metadata)
-        s.execute("DROP TABLE %s" % table)
 
+    def test_prepared_id_is_update(self):
+        """
+        Tests that checks the query id from the prepared statement
+        is updated properly if the table that the prepared statement is querying
+        is altered.
+
+        @since 3.12
+        @jira_ticket PYTHON-808
+
+        The query id from the prepared statment must have changed
+        """
+        prepared_statement = self.session.prepare("SELECT * from {} WHERE a = ?".format(self.table_name))
+        id_before = prepared_statement.result_metadata_id
+        self.assertEqual(len(prepared_statement.result_metadata), 3)
+
+        self.session.execute("ALTER TABLE {} ADD c int".format(self.table_name))
+        bound_statement = prepared_statement.bind((1, ))
+        self.session.execute(bound_statement, timeout=1)
+
+        id_after = prepared_statement.result_metadata_id
+
+        self.assertNotEqual(id_before, id_after)
+        self.assertEqual(len(prepared_statement.result_metadata), 4)
+
+    def test_prepared_id_is_updated_across_pages(self):
+        """
+        Test that checks that the query id from the prepared statement
+        is updated if the table hat the prepared statement is querying
+        is altered while fetching pages in a single query.
+        Then it checks that the updated rows have the expected result.
+
+        @since 3.12
+        @jira_ticket PYTHON-808
+        """
+        prepared_statement = self.session.prepare("SELECT * from {}".format(self.table_name))
+        id_before = prepared_statement.result_metadata_id
+        self.assertEqual(len(prepared_statement.result_metadata), 3)
+
+        prepared_statement.fetch_size = 2
+        result = self.session.execute(prepared_statement.bind((None)))
+
+        self.assertTrue(result.has_more_pages)
+
+        self.session.execute("ALTER TABLE {} ADD c int".format(self.table_name))
+
+        result_set = set(x for x in ((1, 1, 1), (2, 2, 2), (3, 3, None, 3), (4, 4, None, 4)))
+        expected_result_set = set(row for row in result)
+
+        id_after = prepared_statement.result_metadata_id
+
+        self.assertEqual(result_set, expected_result_set)
+        self.assertNotEqual(id_before, id_after)
+        self.assertEqual(len(prepared_statement.result_metadata), 4)
+
+    def test_prepare_id_is_updated_across_session(self):
+        """
+        Test that checks that the query id from the prepared statement
+        is updated if the table hat the prepared statement is querying
+        is altered by a different session
+
+        @since 3.12
+        @jira_ticket PYTHON-808
+        """
+        one_cluster = Cluster(metrics_enabled=True, protocol_version=PROTOCOL_VERSION)
+        one_session = one_cluster.connect()
+        self.addCleanup(one_cluster.shutdown)
+
+        stm = "SELECT * from {} WHERE a = ?".format(self.table_name)
+        one_prepared_stm = one_session.prepare(stm)
+        self.assertEqual(len(one_prepared_stm.result_metadata), 3)
+
+        one_id_before = one_prepared_stm.result_metadata_id
+
+        self.session.execute("ALTER TABLE {} ADD c int".format(self.table_name))
+        one_session.execute(one_prepared_stm, (1, ))
+
+        one_id_after = one_prepared_stm.result_metadata_id
+        self.assertNotEqual(one_id_before, one_id_after)
+        self.assertEqual(len(one_prepared_stm.result_metadata), 4)
+
+    def test_not_reprepare_invalid_statements(self):
+        """
+        Test that checks that an InvalidRequest is arisen if a column
+        expected by the prepared statement is dropped.
+
+        @since 3.12
+        @jira_ticket PYTHON-808
+        """
+        prepared_statement = self.session.prepare(
+            "SELECT a, b, d FROM {} WHERE a = ?".format(self.table_name))
+        self.session.execute("ALTER TABLE {} DROP d".format(self.table_name))
+        with self.assertRaises(InvalidRequest):
+            self.session.execute(prepared_statement.bind((1, )))
+
+    def test_id_is_not_updated_conditional_v4(self):
+        """
+        Test that verifies that the result_metadata and the
+        result_metadata_id are udpated correctly in conditional statements
+        in protocol V4
+
+        @since 3.13
+        @jira_ticket PYTHON-847
+        """
+        cluster = Cluster(protocol_version=ProtocolVersion.V4)
+        session = cluster.connect()
+        self.addCleanup(cluster.shutdown)
+        self._test_updated_conditional(session, 9)
+
+    def test_id_is_not_updated_conditional_v5(self):
+        """
+        Test that verifies that the result_metadata and the
+        result_metadata_id are udpated correctly in conditional statements
+        in protocol V5
+
+        @since 3.13
+        @jira_ticket PYTHON-847
+        """
+        cluster = Cluster(protocol_version=ProtocolVersion.V5)
+        session = cluster.connect()
+        self.addCleanup(cluster.shutdown)
+        self._test_updated_conditional(session, 10)
+
+    def _test_updated_conditional(self, session, value):
+        prepared_statement = session.prepare(
+            "INSERT INTO {}(a, b, d) VALUES "
+            "(?, ? , ?) IF NOT EXISTS".format(self.table_name))
+        first_id = prepared_statement.result_metadata_id
+        LOG.debug('initial result_metadata_id: {}'.format(first_id))
+
+        def check_result_and_metadata(expected):
+            self.assertEqual(
+                session.execute(prepared_statement, (value, value, value))[0],
+                expected
+            )
+            self.assertEqual(prepared_statement.result_metadata_id, first_id)
+            self.assertEqual(prepared_statement.result_metadata, [])
+
+        # Successful conditional update
+        check_result_and_metadata((True,))
+
+        # Failed conditional update
+        check_result_and_metadata((False, value, value, value))
+
+        session.execute("ALTER TABLE {} ADD c int".format(self.table_name))
+
+        # Failed conditional update
+        check_result_and_metadata((False, value, value, None, value))

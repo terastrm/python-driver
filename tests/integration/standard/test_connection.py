@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,18 +22,19 @@ from six.moves import range
 import sys
 from threading import Thread, Event
 import time
+import weakref
 
 from cassandra import ConsistencyLevel, OperationTimedOut
 from cassandra.cluster import NoHostAvailable, ConnectionShutdown, Cluster
 from cassandra.io.asyncorereactor import AsyncoreConnection
 from cassandra.protocol import QueryMessage
 from cassandra.connection import Connection
-from cassandra.policies import WhiteListRoundRobinPolicy, HostStateListener
+from cassandra.policies import HostFilterPolicy, RoundRobinPolicy, HostStateListener
 from cassandra.pool import HostConnectionPool
 
 from tests import is_monkey_patched
-from tests.integration import use_singledc, PROTOCOL_VERSION, get_node, CASSANDRA_IP, local
-
+from tests.integration import use_singledc, PROTOCOL_VERSION, get_node, CASSANDRA_IP, local, \
+    requiresmallclockgranularity, greaterthancass20
 try:
     from cassandra.io.libevreactor import LibevConnection
 except ImportError:
@@ -49,8 +50,12 @@ class ConnectionTimeoutTest(unittest.TestCase):
     def setUp(self):
         self.defaultInFlight = Connection.max_in_flight
         Connection.max_in_flight = 2
-        self.cluster = Cluster(protocol_version=PROTOCOL_VERSION, load_balancing_policy=
-                            WhiteListRoundRobinPolicy([CASSANDRA_IP]))
+        self.cluster = Cluster(
+            protocol_version=PROTOCOL_VERSION,
+            load_balancing_policy=HostFilterPolicy(
+                RoundRobinPolicy(), predicate=lambda host: host.address == CASSANDRA_IP
+            )
+        )
         self.session = self.cluster.connect()
 
     def tearDown(self):
@@ -84,7 +89,10 @@ class TestHostListener(HostStateListener):
     host_down = None
 
     def on_down(self, host):
-        host_down = host
+        self.host_down = True
+
+    def on_up(self, host):
+        self.host_down = False
 
 
 class HeartbeatTest(unittest.TestCase):
@@ -93,7 +101,8 @@ class HeartbeatTest(unittest.TestCase):
 
     @since 3.3
     @jira_ticket PYTHON-286
-    @expected_result host should not be marked down when heartbeat fails
+    @expected_result host should be marked down when heartbeat fails. This
+    happens after PYTHON-734
 
     @test_category connection heartbeat
     """
@@ -106,6 +115,7 @@ class HeartbeatTest(unittest.TestCase):
         self.cluster.shutdown()
 
     @local
+    @greaterthancass20
     def test_heart_beat_timeout(self):
         # Setup a host listener to ensure the nodes don't go down
         test_listener = TestHostListener()
@@ -119,6 +129,10 @@ class HeartbeatTest(unittest.TestCase):
             node.pause()
             # Wait for connections associated with this host go away
             self.wait_for_no_connections(host, self.cluster)
+
+            # Wait to seconds for the driver to be notified
+            time.sleep(2)
+            self.assertTrue(test_listener.host_down)
             # Resume paused node
         finally:
             node.resume()
@@ -133,7 +147,7 @@ class HeartbeatTest(unittest.TestCase):
             time.sleep(.1)
         self.assertLess(count, 100, "Never connected to the first node")
         new_connections = self.wait_for_connections(host, self.cluster)
-        self.assertIsNone(test_listener.host_down)
+        self.assertFalse(test_listener.host_down)
         # Make sure underlying new connections don't match previous ones
         for connection in initial_connections:
             self.assertFalse(connection in new_connections)
@@ -359,6 +373,7 @@ class ConnectionTests(object):
         for t in threads:
             t.join()
 
+    @requiresmallclockgranularity
     def test_connect_timeout(self):
         # Underlying socket implementations don't always throw a socket timeout even with min float
         # This can be timing sensitive, added retry to ensure failure occurs if it can

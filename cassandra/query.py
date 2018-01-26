@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -228,7 +228,8 @@ class Statement(object):
                  is_idempotent=False):
         if retry_policy and not hasattr(retry_policy, 'on_read_timeout'):  # just checking one method to detect positional parameter errors
             raise ValueError('retry_policy should implement cassandra.policies.RetryPolicy')
-        self.retry_policy = retry_policy
+        if retry_policy is not None:
+            self.retry_policy = retry_policy
         if consistency_level is not None:
             self.consistency_level = consistency_level
         self._routing_key = routing_key
@@ -366,9 +367,25 @@ class PreparedStatement(object):
 
     A :class:`.PreparedStatement` should be prepared only once. Re-preparing a statement
     may affect performance (as the operation requires a network roundtrip).
+
+    |prepared_stmt_head|: Do not use ``*`` in prepared statements if you might
+    change the schema of the table being queried. The driver and server each
+    maintain a map between metadata for a schema and statements that were
+    prepared against that schema. When a user changes a schema, e.g. by adding
+    or removing a column, the server invalidates its mappings involving that
+    schema. However, there is currently no way to propagate that invalidation
+    to drivers. Thus, after a schema change, the driver will incorrectly
+    interpret the results of ``SELECT *`` queries prepared before the schema
+    change. This is currently being addressed in `CASSANDRA-10786
+    <https://issues.apache.org/jira/browse/CASSANDRA-10786>`_.
+
+    .. |prepared_stmt_head| raw:: html
+
+       <b>A note about <code>*</code> in prepared statements</b>
     """
 
     column_metadata = None  #TODO: make this bind_metadata in next major
+    retry_policy = None
     consistency_level = None
     custom_payload = None
     fetch_size = FETCH_SIZE_UNSET
@@ -377,12 +394,13 @@ class PreparedStatement(object):
     query_id = None
     query_string = None
     result_metadata = None
+    result_metadata_id = None
     routing_key_indexes = None
     _routing_key_index_set = None
     serial_consistency_level = None
 
     def __init__(self, column_metadata, query_id, routing_key_indexes, query,
-                 keyspace, protocol_version, result_metadata):
+                 keyspace, protocol_version, result_metadata, result_metadata_id):
         self.column_metadata = column_metadata
         self.query_id = query_id
         self.routing_key_indexes = routing_key_indexes
@@ -390,13 +408,15 @@ class PreparedStatement(object):
         self.keyspace = keyspace
         self.protocol_version = protocol_version
         self.result_metadata = result_metadata
+        self.result_metadata_id = result_metadata_id
         self.is_idempotent = False
 
     @classmethod
     def from_message(cls, query_id, column_metadata, pk_indexes, cluster_metadata,
-                     query, prepared_keyspace, protocol_version, result_metadata):
+                     query, prepared_keyspace, protocol_version, result_metadata,
+                     result_metadata_id):
         if not column_metadata:
-            return PreparedStatement(column_metadata, query_id, None, query, prepared_keyspace, protocol_version, result_metadata)
+            return PreparedStatement(column_metadata, query_id, None, query, prepared_keyspace, protocol_version, result_metadata, result_metadata_id)
 
         if pk_indexes:
             routing_key_indexes = pk_indexes
@@ -421,7 +441,8 @@ class PreparedStatement(object):
                         pass          # statement; just leave routing_key_indexes as None
 
         return PreparedStatement(column_metadata, query_id, routing_key_indexes,
-                                 query, prepared_keyspace, protocol_version, result_metadata)
+                                 query, prepared_keyspace, protocol_version, result_metadata,
+                                 result_metadata_id)
 
     def bind(self, values):
         """
@@ -469,6 +490,7 @@ class BoundStatement(Statement):
         """
         self.prepared_statement = prepared_statement
 
+        self.retry_policy = prepared_statement.retry_policy
         self.consistency_level = prepared_statement.consistency_level
         self.serial_consistency_level = prepared_statement.serial_consistency_level
         self.fetch_size = prepared_statement.fetch_size
@@ -481,7 +503,8 @@ class BoundStatement(Statement):
             self.keyspace = meta[0].keyspace_name
 
         Statement.__init__(self, retry_policy, consistency_level, routing_key,
-                           serial_consistency_level, fetch_size, keyspace, custom_payload)
+                           serial_consistency_level, fetch_size, keyspace, custom_payload,
+                           prepared_statement.is_idempotent)
 
     def bind(self, values):
         """

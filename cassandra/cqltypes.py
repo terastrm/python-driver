@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -43,6 +43,8 @@ import sys
 from uuid import UUID
 import warnings
 
+if six.PY3:
+    import ipaddress
 
 from cassandra.marshal import (int8_pack, int8_unpack, int16_pack, int16_unpack,
                                uint16_pack, uint16_unpack, uint32_pack, uint32_unpack,
@@ -517,12 +519,17 @@ class InetAddressType(_CassandraType):
 
     @staticmethod
     def serialize(addr, protocol_version):
-        if ':' in addr:
-            return util.inet_pton(socket.AF_INET6, addr)
-        else:
-            # util.inet_pton could also handle, but this is faster
-            # since we've already determined the AF
-            return socket.inet_aton(addr)
+        try:
+            if ':' in addr:
+                return util.inet_pton(socket.AF_INET6, addr)
+            else:
+                # util.inet_pton could also handle, but this is faster
+                # since we've already determined the AF
+                return socket.inet_aton(addr)
+        except:
+            if six.PY3 and isinstance(addr, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+                return addr.packed
+            raise ValueError("can't interpret %r as an inet address" % (addr,))
 
 
 class CounterColumnType(LongType):
@@ -964,12 +971,14 @@ class UserType(TupleType):
         except ValueError:
             try:
                 t = namedtuple(name, util._positional_rename_invalid_identifiers(field_names))
-                log.warn("could not create a namedtuple for '%s' because one or more field names are not valid Python identifiers (%s); " \
-                         "returning positionally-named fields" % (name, field_names))
+                log.warning("could not create a namedtuple for '%s' because one or more "
+                            "field names are not valid Python identifiers (%s); "
+                            "returning positionally-named fields" % (name, field_names))
             except ValueError:
                 t = None
-                log.warn("could not create a namedtuple for '%s' because the name is not a valid Python identifier; " \
-                         "will return tuples in its place" % (name,))
+                log.warning("could not create a namedtuple for '%s' because the name is "
+                            "not a valid Python identifier; will return tuples in "
+                            "its place" % (name,))
         return t
 
 

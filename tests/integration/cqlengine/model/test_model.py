@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ from cassandra.cqlengine import models
 from cassandra.cqlengine.models import Model, ModelDefinitionException
 from uuid import uuid1
 from tests.integration import pypy
+from tests.integration.cqlengine.base import TestQueryUpdateModel
 
 class TestModel(unittest.TestCase):
     """ Tests the non-io functionality of models """
@@ -173,7 +174,7 @@ class BuiltInAttributeConflictTest(unittest.TestCase):
                 my_primary_key = columns.Integer(primary_key=True)
                 filter = columns.Text()
 
-@pypy
+
 class ModelOverWriteTest(unittest.TestCase):
 
     def test_model_over_write(self):
@@ -207,3 +208,61 @@ class ModelOverWriteTest(unittest.TestCase):
         DerivedTimeModel.create(uuid=uuid_value2, value="second")
         DerivedTimeModel.objects.filter(uuid=uuid_value)
 
+
+class TestColumnComparison(unittest.TestCase):
+    def test_comparison(self):
+        l = [TestQueryUpdateModel.partition.column,
+             TestQueryUpdateModel.cluster.column,
+             TestQueryUpdateModel.count.column,
+             TestQueryUpdateModel.text.column,
+             TestQueryUpdateModel.text_set.column,
+             TestQueryUpdateModel.text_list.column,
+             TestQueryUpdateModel.text_map.column]
+
+        self.assertEqual(l, sorted(l))
+        self.assertNotEqual(TestQueryUpdateModel.partition.column, TestQueryUpdateModel.cluster.column)
+        self.assertLessEqual(TestQueryUpdateModel.partition.column, TestQueryUpdateModel.cluster.column)
+        self.assertGreater(TestQueryUpdateModel.cluster.column, TestQueryUpdateModel.partition.column)
+        self.assertGreaterEqual(TestQueryUpdateModel.cluster.column, TestQueryUpdateModel.partition.column)
+
+
+class TestDeprecationWarning(unittest.TestCase):
+    def test_deprecation_warnings(self):
+        """
+        Test to some deprecation warning have been added. It tests warnings for
+        negative index, negative index slicing and table sensitive removal
+
+        This test should be removed in 4.0, that's why the imports are in
+        this test, so it's easier to remove
+
+        @since 3.13
+        @jira_ticket PYTHON-877
+        @expected_result the deprecation warnings are emitted
+
+        @test_category logs
+        """
+        import warnings
+
+        class SensitiveModel(Model):
+            __table_name__ = 'SensitiveModel'
+            __table_name_case_sensitive__ = True
+            k = columns.Integer(primary_key=True)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            sync_table(SensitiveModel)
+            self.addCleanup(drop_table, SensitiveModel)
+
+            SensitiveModel.create(k=0)
+
+            rows = SensitiveModel.objects().all().allow_filtering()
+            rows[-1]
+            rows[-1:]
+
+            self.assertEqual(len(w), 4)
+            self.assertIn("__table_name_case_sensitive__ will be removed in 4.0.", str(w[0].message))
+            self.assertIn("__table_name_case_sensitive__ will be removed in 4.0.", str(w[1].message))
+            self.assertIn("ModelQuerySet indexing with negative indices support will be removed in 4.0.",
+                          str(w[2].message))
+            self.assertIn("ModelQuerySet slicing with negative indices support will be removed in 4.0.",
+                          str(w[3].message))

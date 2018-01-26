@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -406,12 +406,12 @@ class WhiteListRoundRobinPolicy(RoundRobinPolicy):
     Where connection errors occur when connection
     attempts are made to private IP addresses remotely
     """
+
     def __init__(self, hosts):
         """
         The `hosts` parameter should be a sequence of hosts to permit
         connections to.
         """
-
         self._allowed_hosts = hosts
         self._allowed_hosts_resolved = [endpoint[4][0] for a in self._allowed_hosts
                                         for endpoint in socket.getaddrinfo(a, None, socket.AF_UNSPEC, socket.SOCK_STREAM)]
@@ -439,6 +439,118 @@ class WhiteListRoundRobinPolicy(RoundRobinPolicy):
     def on_add(self, host):
         if host.address in self._allowed_hosts_resolved:
             RoundRobinPolicy.on_add(self, host)
+
+
+class HostFilterPolicy(LoadBalancingPolicy):
+    """
+    A :class:`.LoadBalancingPolicy` subclass configured with a child policy,
+    and a single-argument predicate. This policy defers to the child policy for
+    hosts where ``predicate(host)`` is truthy. Hosts for which
+    ``predicate(host)`` is falsey will be considered :attr:`.IGNORED`, and will
+    not be used in a query plan.
+
+    This can be used in the cases where you need a whitelist or blacklist
+    policy, e.g. to prepare for decommissioning nodes or for testing:
+
+    .. code-block:: python
+
+        def address_is_ignored(host):
+            return host.address in [ignored_address0, ignored_address1]
+
+        blacklist_filter_policy = HostFilterPolicy(
+            child_policy=RoundRobinPolicy(),
+            predicate=address_is_ignored
+        )
+
+        cluster = Cluster(
+            primary_host,
+            load_balancing_policy=blacklist_filter_policy,
+        )
+
+    See the note in the :meth:`.make_query_plan` documentation for a caveat on
+    how wrapping ordering polices (e.g. :class:`.RoundRobinPolicy`) may break
+    desirable properties of the wrapped policy.
+
+    Please note that whitelist and blacklist policies are not recommended for
+    general, day-to-day use. You probably want something like
+    :class:`.DCAwareRoundRobinPolicy`, which prefers a local DC but has
+    fallbacks, over a brute-force method like whitelisting or blacklisting.
+    """
+
+    def __init__(self, child_policy, predicate):
+        """
+        :param child_policy: an instantiated :class:`.LoadBalancingPolicy`
+                             that this one will defer to.
+        :param predicate: a one-parameter function that takes a :class:`.Host`.
+                          If it returns a falsey value, the :class:`.Host` will
+                          be :attr:`.IGNORED` and not returned in query plans.
+        """
+        super(HostFilterPolicy, self).__init__()
+        self._child_policy = child_policy
+        self._predicate = predicate
+
+    def on_up(self, host, *args, **kwargs):
+        return self._child_policy.on_up(host, *args, **kwargs)
+
+    def on_down(self, host, *args, **kwargs):
+        return self._child_policy.on_down(host, *args, **kwargs)
+
+    def on_add(self, host, *args, **kwargs):
+        return self._child_policy.on_add(host, *args, **kwargs)
+
+    def on_remove(self, host, *args, **kwargs):
+        return self._child_policy.on_remove(host, *args, **kwargs)
+
+    @property
+    def predicate(self):
+        """
+        A predicate, set on object initialization, that takes a :class:`.Host`
+        and returns a value. If the value is falsy, the :class:`.Host` is
+        :class:`~HostDistance.IGNORED`. If the value is truthy,
+        :class:`.HostFilterPolicy` defers to the child policy to determine the
+        host's distance.
+
+        This is a read-only value set in ``__init__``, implemented as a
+        ``property``.
+        """
+        return self._predicate
+
+    def distance(self, host):
+        """
+        Checks if ``predicate(host)``, then returns
+        :attr:`~HostDistance.IGNORED` if falsey, and defers to the child policy
+        otherwise.
+        """
+        if self.predicate(host):
+            return self._child_policy.distance(host)
+        else:
+            return HostDistance.IGNORED
+
+    def populate(self, cluster, hosts):
+        self._child_policy.populate(cluster=cluster, hosts=hosts)
+
+    def make_query_plan(self, working_keyspace=None, query=None):
+        """
+        Defers to the child policy's
+        :meth:`.LoadBalancingPolicy.make_query_plan` and filters the results.
+
+        Note that this filtering may break desirable properties of the wrapped
+        policy in some cases. For instance, imagine if you configure this
+        policy to filter out ``host2``, and to wrap a round-robin policy that
+        rotates through three hosts in the order ``host1, host2, host3``,
+        ``host2, host3, host1``, ``host3, host1, host2``, repeating. This
+        policy will yield ``host1, host3``, ``host3, host1``, ``host3, host1``,
+        disproportionately favoring ``host3``.
+        """
+        child_qp = self._child_policy.make_query_plan(
+            working_keyspace=working_keyspace, query=query
+        )
+        for host in child_qp:
+            if self.predicate(host):
+                yield host
+
+    def check_supported(self):
+        return self._child_policy.check_supported()
 
 
 class ConvictionPolicy(object):
@@ -564,9 +676,17 @@ class ExponentialReconnectionPolicy(ReconnectionPolicy):
         self.max_attempts = max_attempts
 
     def new_schedule(self):
-        i = 0
+        i, overflowed = 0, False
         while self.max_attempts is None or i < self.max_attempts:
-            yield min(self.base_delay * (2 ** i), self.max_delay)
+            if overflowed:
+                yield self.max_delay
+            else:
+                try:
+                    yield min(self.base_delay * (2 ** i), self.max_delay)
+                except OverflowError:
+                    overflowed = True
+                    yield self.max_delay
+
             i += 1
 
 
@@ -611,13 +731,28 @@ class WriteType(object):
     A lighweight-transaction write, such as "DELETE ... IF EXISTS".
     """
 
+    VIEW = 6
+    """
+    This WriteType is only seen in results for requests that were unable to
+    complete MV operations.
+    """
+
+    CDC = 7
+    """
+    This WriteType is only seen in results for requests that were unable to
+    complete CDC operations.
+    """
+
+
 WriteType.name_to_value = {
     'SIMPLE': WriteType.SIMPLE,
     'BATCH': WriteType.BATCH,
     'UNLOGGED_BATCH': WriteType.UNLOGGED_BATCH,
     'COUNTER': WriteType.COUNTER,
     'BATCH_LOG': WriteType.BATCH_LOG,
-    'CAS': WriteType.CAS
+    'CAS': WriteType.CAS,
+    'VIEW': WriteType.VIEW,
+    'CDC': WriteType.CDC
 }
 
 

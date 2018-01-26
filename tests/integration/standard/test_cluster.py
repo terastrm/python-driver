@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,25 +23,30 @@ from mock import Mock, call, patch
 import time
 from uuid import uuid4
 import logging
+import warnings
 
 import cassandra
 from cassandra.cluster import Cluster, Session, NoHostAvailable, ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.concurrent import execute_concurrent
 from cassandra.policies import (RoundRobinPolicy, ExponentialReconnectionPolicy,
                                 RetryPolicy, SimpleConvictionPolicy, HostDistance,
-                                WhiteListRoundRobinPolicy, AddressTranslator)
+                                AddressTranslator, TokenAwarePolicy, HostFilterPolicy)
+from cassandra import ConsistencyLevel
+
 from cassandra.pool import Host
 from cassandra.query import SimpleStatement, TraceUnavailable, tuple_factory
 
-
-from tests.integration import use_singledc, PROTOCOL_VERSION, get_server_versions, CASSANDRA_VERSION, DSE_VERSION, execute_until_pass, execute_with_long_wait_retry, get_node,\
-    MockLoggingHandler, get_unsupported_lower_protocol, get_unsupported_upper_protocol, protocolv5, local, CASSANDRA_IP
+from tests import notwindows
+from tests.integration import use_singledc, PROTOCOL_VERSION, get_server_versions, CASSANDRA_VERSION, \
+    execute_until_pass, execute_with_long_wait_retry, get_node, MockLoggingHandler, get_unsupported_lower_protocol, \
+    get_unsupported_upper_protocol, protocolv5, local, CASSANDRA_IP, greaterthanorequalcass30, lessthanorequalcass40
 from tests.integration.util import assert_quiescent_pool_state
 import sys
 
 
 def setup_module():
     use_singledc()
+    warnings.simplefilter("always")
 
 
 class IgnoredHostPolicy(RoundRobinPolicy):
@@ -192,13 +197,23 @@ class ClusterTests(unittest.TestCase):
 
         @test_category connection
         """
+        # Test with empty list
+        cluster = Cluster(protocol_version=PROTOCOL_VERSION)
         with self.assertRaises(NoHostAvailable):
-            Session(Cluster(protocol_version=PROTOCOL_VERSION), [])
+            Session(cluster, [])
+        cluster.shutdown()
+
+        # Test with only invalid
+        cluster = Cluster(protocol_version=PROTOCOL_VERSION)
         with self.assertRaises(NoHostAvailable):
-            Session(Cluster(protocol_version=PROTOCOL_VERSION), [Host("1.2.3.4", SimpleConvictionPolicy)])
-        session = Session(Cluster(protocol_version=PROTOCOL_VERSION), [Host(x, SimpleConvictionPolicy) for x in
+            Session(cluster, [Host("1.2.3.4", SimpleConvictionPolicy)])
+        cluster.shutdown()
+
+        # Test with valid and invalid hosts
+        cluster = Cluster(protocol_version=PROTOCOL_VERSION)
+        Session(cluster, [Host(x, SimpleConvictionPolicy) for x in
                                       ("127.0.0.1", "127.0.0.2", "1.2.3.4")])
-        session.shutdown()
+        cluster.shutdown()
 
     def test_protocol_negotiation(self):
         """
@@ -282,15 +297,15 @@ class ClusterTests(unittest.TestCase):
         session = cluster.connect()
         result = session.execute(
             """
-            INSERT INTO test3rf.test (k, v) VALUES (8889, 8889)
+            INSERT INTO test1rf.test (k, v) VALUES (8889, 8889)
             """)
         self.assertFalse(result)
 
-        result = session.execute("SELECT * FROM test3rf.test")
-        self.assertEqual([(8889, 8889)], result)
+        result = session.execute("SELECT * FROM test1rf.test")
+        self.assertEqual([(8889, 8889)], result, "Rows in ResultSet are {0}".format(result.current_rows))
 
         # test_connect_on_keyspace
-        session2 = cluster.connect('test3rf')
+        session2 = cluster.connect('test1rf')
         result2 = session2.execute("SELECT * FROM test")
         self.assertEqual(result, result2)
         cluster.shutdown()
@@ -464,10 +479,14 @@ class ClusterTests(unittest.TestCase):
         cluster.shutdown()
 
     @local
+    @notwindows
     def test_refresh_schema_no_wait(self):
         contact_points = [CASSANDRA_IP]
         cluster = Cluster(protocol_version=PROTOCOL_VERSION, max_schema_agreement_wait=10,
-                          contact_points=contact_points, load_balancing_policy=WhiteListRoundRobinPolicy(contact_points))
+                          contact_points=contact_points,
+                          load_balancing_policy=HostFilterPolicy(
+                              RoundRobinPolicy(), lambda host: host.address == CASSANDRA_IP
+                          ))
         session = cluster.connect()
 
         schema_ver = session.execute("SELECT schema_version FROM system.local WHERE key='local'")[0][0]
@@ -544,20 +563,13 @@ class ClusterTests(unittest.TestCase):
         cluster = Cluster(protocol_version=PROTOCOL_VERSION)
         session = cluster.connect()
 
-        def check_trace(trace):
-            self.assertIsNotNone(trace.request_type)
-            self.assertIsNotNone(trace.duration)
-            self.assertIsNotNone(trace.started_at)
-            self.assertIsNotNone(trace.coordinator)
-            self.assertIsNotNone(trace.events)
-
         result = session.execute( "SELECT * FROM system.local", trace=True)
-        check_trace(result.get_query_trace())
+        self._check_trace(result.get_query_trace())
 
         query = "SELECT * FROM system.local"
         statement = SimpleStatement(query)
         result = session.execute(statement, trace=True)
-        check_trace(result.get_query_trace())
+        self._check_trace(result.get_query_trace())
 
         query = "SELECT * FROM system.local"
         statement = SimpleStatement(query)
@@ -567,7 +579,7 @@ class ClusterTests(unittest.TestCase):
         statement2 = SimpleStatement(query)
         future = session.execute_async(statement2, trace=True)
         future.result()
-        check_trace(future.get_query_trace())
+        self._check_trace(future.get_query_trace())
 
         statement2 = SimpleStatement(query)
         future = session.execute_async(statement2)
@@ -577,19 +589,54 @@ class ClusterTests(unittest.TestCase):
         prepared = session.prepare("SELECT * FROM system.local")
         future = session.execute_async(prepared, parameters=(), trace=True)
         future.result()
-        check_trace(future.get_query_trace())
+        self._check_trace(future.get_query_trace())
         cluster.shutdown()
 
-    def test_trace_timeout(self):
+    def test_trace_unavailable(self):
+        """
+        First checks that TraceUnavailable is arisen if the
+        max_wait parameter is negative
+
+        Then checks that TraceUnavailable is arisen if the
+        result hasn't been set yet
+
+        @since 3.10
+        @jira_ticket PYTHON-196
+        @expected_result TraceUnavailable is arisen in both cases
+
+        @test_category query
+                """
         cluster = Cluster(protocol_version=PROTOCOL_VERSION)
+        self.addCleanup(cluster.shutdown)
         session = cluster.connect()
 
         query = "SELECT * FROM system.local"
         statement = SimpleStatement(query)
-        future = session.execute_async(statement, trace=True)
-        future.result()
-        self.assertRaises(TraceUnavailable, future.get_query_trace, -1.0)
-        cluster.shutdown()
+
+        max_retry_count = 10
+        for i in range(max_retry_count):
+            future = session.execute_async(statement, trace=True)
+            future.result()
+            try:
+                result = future.get_query_trace(-1.0)
+                # In case the result has time to come back before this timeout due to a race condition
+                self._check_trace(result)
+            except TraceUnavailable:
+                break
+        else:
+            raise Exception("get_query_trace didn't raise TraceUnavailable after {} tries".format(max_retry_count))
+
+
+        for i in range(max_retry_count):
+            future = session.execute_async(statement, trace=True)
+            try:
+                result = future.get_query_trace(max_wait=120)
+                # In case the result has been set check the trace
+                self._check_trace(result)
+            except TraceUnavailable:
+                break
+        else:
+            raise Exception("get_query_trace didn't raise TraceUnavailable after {} tries".format(max_retry_count))
 
     def test_string_coverage(self):
         """
@@ -729,7 +776,11 @@ class ClusterTests(unittest.TestCase):
         @test_category config_profiles
         """
         query = "select release_version from system.local"
-        node1 = ExecutionProfile(load_balancing_policy=WhiteListRoundRobinPolicy([CASSANDRA_IP]))
+        node1 = ExecutionProfile(
+            load_balancing_policy=HostFilterPolicy(
+                RoundRobinPolicy(), lambda host: host.address == CASSANDRA_IP
+            )
+        )
         with Cluster(execution_profiles={'node1': node1}) as cluster:
             session = cluster.connect(wait_for_all_pools=True)
 
@@ -769,6 +820,18 @@ class ClusterTests(unittest.TestCase):
 
             # make sure original profile is not impacted
             self.assertTrue(session.execute(query, execution_profile='node1')[0].release_version)
+
+    def test_setting_lbp_legacy(self):
+        cluster = Cluster()
+        self.addCleanup(cluster.shutdown)
+        cluster.load_balancing_policy = RoundRobinPolicy()
+        self.assertEqual(
+            list(cluster.load_balancing_policy.make_query_plan()), []
+        )
+        cluster.connect()
+        self.assertNotEqual(
+            list(cluster.load_balancing_policy.make_query_plan()), []
+        )
 
     def test_profile_lb_swap(self):
         """
@@ -880,8 +943,16 @@ class ClusterTests(unittest.TestCase):
         @test_category config_profiles
         """
 
-        node1 = ExecutionProfile(load_balancing_policy=WhiteListRoundRobinPolicy(['127.0.0.1']))
-        node2 = ExecutionProfile(load_balancing_policy=WhiteListRoundRobinPolicy(['127.0.0.2']))
+        node1 = ExecutionProfile(
+            load_balancing_policy=HostFilterPolicy(
+                RoundRobinPolicy(), lambda host: host.address == "127.0.0.1"
+            )
+        )
+        node2 = ExecutionProfile(
+            load_balancing_policy=HostFilterPolicy(
+                RoundRobinPolicy(), lambda host: host.address == "127.0.0.2"
+            )
+        )
         with Cluster(execution_profiles={EXEC_PROFILE_DEFAULT: node1, 'node2': node2}) as cluster:
             session = cluster.connect(wait_for_all_pools=True)
             pools = session.get_pool_state()
@@ -890,7 +961,11 @@ class ClusterTests(unittest.TestCase):
             self.assertEqual(set(h.address for h in pools), set(('127.0.0.1', '127.0.0.2')))
 
             # dynamically update pools on add
-            node3 = ExecutionProfile(load_balancing_policy=WhiteListRoundRobinPolicy(['127.0.0.3']))
+            node3 = ExecutionProfile(
+                load_balancing_policy=HostFilterPolicy(
+                    RoundRobinPolicy(), lambda host: host.address == "127.0.0.3"
+                )
+            )
             cluster.add_execution_profile('node3', node3)
             pools = session.get_pool_state()
             self.assertEqual(set(h.address for h in pools), set(('127.0.0.1', '127.0.0.2', '127.0.0.3')))
@@ -908,14 +983,22 @@ class ClusterTests(unittest.TestCase):
         """
         max_retry_count = 10
         for i in range(max_retry_count):
-            node1 = ExecutionProfile(load_balancing_policy=WhiteListRoundRobinPolicy(['127.0.0.1']))
+            node1 = ExecutionProfile(
+                load_balancing_policy=HostFilterPolicy(
+                    RoundRobinPolicy(), lambda host: host.address == "127.0.0.1"
+                )
+            )
             with Cluster(execution_profiles={EXEC_PROFILE_DEFAULT: node1}) as cluster:
                 session = cluster.connect(wait_for_all_pools=True)
                 pools = session.get_pool_state()
                 self.assertGreater(len(cluster.metadata.all_hosts()), 2)
                 self.assertEqual(set(h.address for h in pools), set(('127.0.0.1',)))
 
-                node2 = ExecutionProfile(load_balancing_policy=WhiteListRoundRobinPolicy(['127.0.0.2', '127.0.0.3']))
+                node2 = ExecutionProfile(
+                    load_balancing_policy=HostFilterPolicy(
+                        RoundRobinPolicy(), lambda host: host.address in ["127.0.0.2", "127.0.0.3"]
+                    )
+                )
 
                 start = time.time()
                 try:
@@ -928,6 +1011,132 @@ class ClusterTests(unittest.TestCase):
                     self.assertAlmostEqual(start, end, 1)
         else:
             raise Exception("add_execution_profile didn't timeout after {0} retries".format(max_retry_count))
+
+    def test_replicas_are_queried(self):
+        """
+        Test that replicas are queried first for TokenAwarePolicy. A table with RF 1
+        is created. All the queries should go to that replica when TokenAwarePolicy
+        is used.
+        Then using HostFilterPolicy the replica is excluded from the considered hosts.
+        By checking the trace we verify that there are no more replicas.
+
+        @since 3.5
+        @jira_ticket PYTHON-653
+        @expected_result the replicas are queried for HostFilterPolicy
+
+        @test_category metadata
+        """
+        queried_hosts = set()
+        with Cluster(protocol_version=PROTOCOL_VERSION,
+                     load_balancing_policy=TokenAwarePolicy(RoundRobinPolicy())) as cluster:
+            session = cluster.connect(wait_for_all_pools=True)
+            session.execute('''
+                    CREATE TABLE test1rf.table_with_big_key (
+                        k1 int,
+                        k2 int,
+                        k3 int,
+                        k4 int,
+                        PRIMARY KEY((k1, k2, k3), k4))''')
+            prepared = session.prepare("""SELECT * from test1rf.table_with_big_key
+                                          WHERE k1 = ? AND k2 = ? AND k3 = ? AND k4 = ?""")
+            for i in range(10):
+                result = session.execute(prepared, (i, i, i, i), trace=True)
+                trace = result.response_future.get_query_trace(query_cl=ConsistencyLevel.ALL)
+                queried_hosts = self._assert_replica_queried(trace, only_replicas=True)
+                last_i = i
+
+        only_replica = queried_hosts.pop()
+        log = logging.getLogger(__name__)
+        log.info("The only replica found was: {}".format(only_replica))
+        available_hosts = [host for host in ["127.0.0.1", "127.0.0.2", "127.0.0.3"] if host != only_replica]
+        with Cluster(contact_points=available_hosts,
+                     protocol_version=PROTOCOL_VERSION,
+                     load_balancing_policy=HostFilterPolicy(RoundRobinPolicy(),
+                     predicate=lambda host: host.address != only_replica)) as cluster:
+
+            session = cluster.connect(wait_for_all_pools=True)
+            prepared = session.prepare("""SELECT * from test1rf.table_with_big_key
+                                          WHERE k1 = ? AND k2 = ? AND k3 = ? AND k4 = ?""")
+            for _ in range(10):
+                result = session.execute(prepared, (last_i, last_i, last_i, last_i), trace=True)
+                trace = result.response_future.get_query_trace(query_cl=ConsistencyLevel.ALL)
+                self._assert_replica_queried(trace, only_replicas=False)
+
+            session.execute('''DROP TABLE test1rf.table_with_big_key''')
+
+    @unittest.skip
+    @greaterthanorequalcass30
+    @lessthanorequalcass40
+    def test_compact_option(self):
+        """
+        Test the driver can connect with the no_compact option and the results
+        are as expected. This test is very similar to the corresponding dtest
+
+        @since 3.12
+        @jira_ticket PYTHON-366
+        @expected_result only one hosts' metadata will be populated
+
+        @test_category connection
+        """
+        nc_cluster = Cluster(protocol_version=PROTOCOL_VERSION, no_compact=True)
+        nc_session = nc_cluster.connect()
+
+        cluster = Cluster(protocol_version=PROTOCOL_VERSION, no_compact=False)
+        session = cluster.connect()
+
+        self.addCleanup(cluster.shutdown)
+        self.addCleanup(nc_cluster.shutdown)
+
+        nc_session.set_keyspace("test3rf")
+        session.set_keyspace("test3rf")
+
+        nc_session.execute(
+            "CREATE TABLE IF NOT EXISTS compact_table (k int PRIMARY KEY, v1 int, v2 int) WITH COMPACT STORAGE;")
+
+        for i in range(1, 5):
+            nc_session.execute(
+                "INSERT INTO compact_table (k, column1, v1, v2, value) VALUES "
+                "({i}, 'a{i}', {i}, {i}, textAsBlob('b{i}'))".format(i=i))
+            nc_session.execute(
+                "INSERT INTO compact_table (k, column1, v1, v2, value) VALUES "
+                "({i}, 'a{i}{i}', {i}{i}, {i}{i}, textAsBlob('b{i}{i}'))".format(i=i))
+
+        nc_results = nc_session.execute("SELECT * FROM compact_table")
+        self.assertEqual(
+            set(nc_results.current_rows),
+            {(1, u'a1', 11, 11, 'b1'),
+             (1, u'a11', 11, 11, 'b11'),
+             (2, u'a2', 22, 22, 'b2'),
+             (2, u'a22', 22, 22, 'b22'),
+             (3, u'a3', 33, 33, 'b3'),
+             (3, u'a33', 33, 33, 'b33'),
+             (4, u'a4', 44, 44, 'b4'),
+             (4, u'a44', 44, 44, 'b44')})
+
+        results = session.execute("SELECT * FROM compact_table")
+        self.assertEqual(
+            set(results.current_rows),
+            {(1, 11, 11),
+             (2, 22, 22),
+             (3, 33, 33),
+             (4, 44, 44)})
+
+    def _assert_replica_queried(self, trace, only_replicas=True):
+        queried_hosts = set()
+        for row in trace.events:
+            queried_hosts.add(row.source)
+        if only_replicas:
+            self.assertEqual(len(queried_hosts), 1, "The hosts queried where {}".format(queried_hosts))
+        else:
+            self.assertGreater(len(queried_hosts), 1, "The host queried was {}".format(queried_hosts))
+        return queried_hosts
+
+    def _check_trace(self, trace):
+        self.assertIsNotNone(trace.request_type)
+        self.assertIsNotNone(trace.duration)
+        self.assertIsNotNone(trace.started_at)
+        self.assertIsNotNone(trace.coordinator)
+        self.assertIsNotNone(trace.events)
 
 
 class LocalHostAdressTranslator(AddressTranslator):
@@ -985,7 +1194,9 @@ class TestAddressTranslation(unittest.TestCase):
 
 @local
 class ContextManagementTest(unittest.TestCase):
-    load_balancing_policy = WhiteListRoundRobinPolicy([CASSANDRA_IP])
+    load_balancing_policy = HostFilterPolicy(
+        RoundRobinPolicy(), lambda host: host.address == CASSANDRA_IP
+    )
     cluster_kwargs = {'execution_profiles': {EXEC_PROFILE_DEFAULT: ExecutionProfile(load_balancing_policy=
                                                                                     load_balancing_policy)},
                       'schema_metadata_enabled': False,
@@ -1103,9 +1314,9 @@ class HostStateTest(unittest.TestCase):
                 time.sleep(.01)
             self.assertTrue(was_marked_down)
 
+
 @local
 class DontPrepareOnIgnoredHostsTest(unittest.TestCase):
-
     ignored_addresses = ['127.0.0.3']
     ignore_node_3_policy = IgnoredHostPolicy(ignored_addresses)
 
@@ -1141,10 +1352,12 @@ class DontPrepareOnIgnoredHostsTest(unittest.TestCase):
             self.assertEqual(call(unignored_address), c)
         cluster.shutdown()
 
+
 @local
 class DuplicateRpcTest(unittest.TestCase):
 
-    load_balancing_policy = WhiteListRoundRobinPolicy(['127.0.0.1'])
+    load_balancing_policy = HostFilterPolicy(RoundRobinPolicy(),
+                                             lambda host: host.address == "127.0.0.1")
 
     def setUp(self):
         self.cluster = Cluster(protocol_version=PROTOCOL_VERSION, load_balancing_policy=self.load_balancing_policy)
@@ -1177,7 +1390,6 @@ class DuplicateRpcTest(unittest.TestCase):
         self.assertTrue('multiple' in warnings[0])
         logger.removeHandler(mock_handler)
         test_cluster.shutdown()
-
 
 
 @protocolv5
@@ -1218,3 +1430,40 @@ class BetaProtocolTest(unittest.TestCase):
         self.assertEqual(cluster.protocol_version, cassandra.ProtocolVersion.MAX_SUPPORTED)
         self.assertTrue(session.execute("select release_version from system.local")[0])
         cluster.shutdown()
+
+
+class DeprecationWarningTest(unittest.TestCase):
+    def test_deprecation_warnings_legacy_parameters(self):
+        """
+        Tests the deprecation warning has been added when using
+        legacy parameters
+
+        @since 3.13
+        @jira_ticket PYTHON-877
+        @expected_result the deprecation warning is emitted
+
+        @test_category logs
+        """
+        with warnings.catch_warnings(record=True) as w:
+            Cluster(load_balancing_policy=RoundRobinPolicy())
+            self.assertEqual(len(w), 1)
+            self.assertIn("Legacy execution parameters will be removed in 4.0. Consider using execution profiles.",
+                          str(w[0].message))
+
+    def test_deprecation_warnings_meta_refreshed(self):
+        """
+        Tests the deprecation warning has been added when enabling
+        metadata refreshment
+
+        @since 3.13
+        @jira_ticket PYTHON-890
+        @expected_result the deprecation warning is emitted
+
+        @test_category logs
+        """
+        with warnings.catch_warnings(record=True) as w:
+            cluster = Cluster()
+            cluster.set_meta_refresh_enabled(True)
+            self.assertEqual(len(w), 1)
+            self.assertIn("Cluster.set_meta_refresh_enabled is deprecated and will be removed in 4.0.",
+                          str(w[0].message))

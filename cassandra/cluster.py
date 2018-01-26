@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ from copy import copy
 from functools import partial, wraps
 from itertools import groupby, count
 import logging
+from warnings import warn
 from random import random
 import six
 from six.moves import filter, range, queue as Queue
@@ -242,10 +243,19 @@ class ExecutionProfile(object):
     Defaults to :class:`.NoSpeculativeExecutionPolicy` if not specified
     """
 
-    def __init__(self, load_balancing_policy=None, retry_policy=None,
+    # indicates if lbp was set explicitly or uses default values
+    _load_balancing_policy_explicit = False
+
+    def __init__(self, load_balancing_policy=_NOT_SET, retry_policy=None,
                  consistency_level=ConsistencyLevel.LOCAL_ONE, serial_consistency_level=None,
                  request_timeout=10.0, row_factory=named_tuple_factory, speculative_execution_policy=None):
-        self.load_balancing_policy = load_balancing_policy or default_lbp_factory()
+
+        if load_balancing_policy is _NOT_SET:
+            self._load_balancing_policy_explicit = False
+            self.load_balancing_policy = default_lbp_factory()
+        else:
+            self._load_balancing_policy_explicit = True
+            self.load_balancing_policy = load_balancing_policy
         self.retry_policy = retry_policy or RetryPolicy()
         self.consistency_level = consistency_level
         self.serial_consistency_level = serial_consistency_level
@@ -258,6 +268,15 @@ class ProfileManager(object):
 
     def __init__(self):
         self.profiles = dict()
+
+    def _profiles_without_explicit_lbps(self):
+        names = (profile_name for
+                 profile_name, profile in self.profiles.items()
+                 if not profile._load_balancing_policy_explicit)
+        return tuple(
+            'EXEC_PROFILE_DEFAULT' if n is EXEC_PROFILE_DEFAULT else n
+            for n in names
+        )
 
     def distance(self, host):
         distances = set(p.load_balancing_policy.distance(host) for p in self.profiles.values())
@@ -341,7 +360,14 @@ class Cluster(object):
     local_dc set (as is the default), the DC is chosen from an arbitrary
     host in contact_points. In this case, contact_points should contain
     only nodes from a single, local DC.
+
+    Note: In the next major version, if you specify contact points, you will
+    also be required to also explicitly specify a load-balancing policy. This
+    change will help prevent cases where users had hard-to-debug issues
+    surrounding unintuitive default load-balancing policy behavior.
     """
+    # tracks if contact_points was set explicitly or with default values
+    _contact_points_explicit = None
 
     port = 9042
     """
@@ -370,6 +396,9 @@ class Cluster(object):
     """
 
     allow_beta_protocol_version = False
+
+    no_compact = False
+
     """
     Setting true injects a flag in all messages that makes the server accept and use "beta" protocol version.
     Used for testing new protocol features incrementally before the new version is complete.
@@ -565,6 +594,7 @@ class Cluster(object):
     * :class:`cassandra.io.eventletreactor.EventletConnection` (requires monkey-patching - see doc for details)
     * :class:`cassandra.io.geventreactor.GeventConnection` (requires monkey-patching - see doc for details)
     * :class:`cassandra.io.twistedreactor.TwistedConnection`
+    * EXPERIMENTAL: :class:`cassandra.io.asyncioreactor.AsyncioConnection`
 
     By default, ``AsyncoreConnection`` will be used, which uses
     the ``asyncore`` module in the Python standard library.
@@ -573,6 +603,11 @@ class Cluster(object):
 
     If ``gevent`` or ``eventlet`` monkey-patching is detected, the corresponding
     connection class will be used automatically.
+
+    ``AsyncioConnection``, which uses the ``asyncio`` module in the Python
+    standard library, is also available, but currently experimental. Note that
+    it requires ``asyncio`` features that were only introduced in the 3.4 line
+    in 3.4.6, and in the 3.5 line in 3.5.1.
     """
 
     control_connection_timeout = 2.0
@@ -588,6 +623,12 @@ class Cluster(object):
     keep connections open through network devices that expire idle connections.
     It also helps discover bad connections early in low-traffic scenarios.
     Setting to zero disables heartbeats.
+    """
+
+    idle_heartbeat_timeout = 30
+    """
+    Timeout, in seconds, on which the heartbeat wait for idle connection responses.
+    Lowering this value can help to discover bad connections earlier.
     """
 
     schema_event_refresh_window = 2
@@ -727,7 +768,7 @@ class Cluster(object):
     _listener_lock = None
 
     def __init__(self,
-                 contact_points=["127.0.0.1"],
+                 contact_points=_NOT_SET,
                  port=9042,
                  compression=True,
                  auth_provider=None,
@@ -756,7 +797,9 @@ class Cluster(object):
                  reprepare_on_up=True,
                  execution_profiles=None,
                  allow_beta_protocol_version=False,
-                 timestamp_generator=None):
+                 timestamp_generator=None,
+                 idle_heartbeat_timeout=30,
+                 no_compact=False):
         """
         ``executor_threads`` defines the number of threads in a pool for handling asynchronous tasks such as
         extablishing connection pools or refreshing metadata.
@@ -764,6 +807,12 @@ class Cluster(object):
         Any of the mutable Cluster attributes may be set as keyword arguments to the constructor.
         """
         if contact_points is not None:
+            if contact_points is _NOT_SET:
+                self._contact_points_explicit = False
+                contact_points = ['127.0.0.1']
+            else:
+                self._contact_points_explicit = True
+
             if isinstance(contact_points, six.string_types):
                 raise TypeError("contact_points should not be a string, it should be a sequence (e.g. list) of strings")
 
@@ -782,6 +831,8 @@ class Cluster(object):
             self.protocol_version = protocol_version
             self._protocol_version_explicit = True
         self.allow_beta_protocol_version = allow_beta_protocol_version
+
+        self.no_compact = no_compact
 
         self.auth_provider = auth_provider
 
@@ -834,11 +885,38 @@ class Cluster(object):
             if execution_profiles:
                 raise ValueError("Clusters constructed with execution_profiles should not specify legacy parameters "
                                  "load_balancing_policy or default_retry_policy. Configure this in a profile instead.")
+
             self._config_mode = _ConfigMode.LEGACY
+            warn("Legacy execution parameters will be removed in 4.0. Consider using "
+                 "execution profiles.", DeprecationWarning)
+
         else:
             if execution_profiles:
                 self.profile_manager.profiles.update(execution_profiles)
                 self._config_mode = _ConfigMode.PROFILES
+
+        if self._contact_points_explicit:
+            if self._config_mode is _ConfigMode.PROFILES:
+                default_lbp_profiles = self.profile_manager._profiles_without_explicit_lbps()
+                if default_lbp_profiles:
+                    log.warning(
+                        'Cluster.__init__ called with contact_points '
+                        'specified, but load-balancing policies are not '
+                        'specified in some ExecutionProfiles. In the next '
+                        'major version, this will raise an error; please '
+                        'specify a load-balancing policy. '
+                        '(contact_points = {cp}, '
+                        'EPs without explicit LBPs = {eps})'
+                        ''.format(cp=contact_points, eps=default_lbp_profiles))
+            else:
+                if load_balancing_policy is None:
+                    log.warning(
+                        'Cluster.__init__ called with contact_points '
+                        'specified, but no load_balancing_policy. In the next '
+                        'major version, this will raise an error; please '
+                        'specify a load-balancing policy. '
+                        '(contact_points = {cp}, lbp = {lbp})'
+                        ''.format(cp=contact_points, lbp=load_balancing_policy))
 
         self.metrics_enabled = metrics_enabled
         self.ssl_options = ssl_options
@@ -847,6 +925,7 @@ class Cluster(object):
         self.max_schema_agreement_wait = max_schema_agreement_wait
         self.control_connection_timeout = control_connection_timeout
         self.idle_heartbeat_interval = idle_heartbeat_interval
+        self.idle_heartbeat_timeout = idle_heartbeat_timeout
         self.schema_event_refresh_window = schema_event_refresh_window
         self.topology_event_refresh_window = topology_event_refresh_window
         self.status_event_refresh_window = status_event_refresh_window
@@ -956,7 +1035,7 @@ class Cluster(object):
                         "be returned when reading type %s.%s.", self.protocol_version, keyspace, user_type)
 
         self._user_types[keyspace][user_type] = klass
-        for session in self.sessions:
+        for session in tuple(self.sessions):
             session.user_type_registered(keyspace, user_type, klass)
         UserType.evict_udt_class(keyspace, user_type)
 
@@ -980,13 +1059,28 @@ class Cluster(object):
             raise ValueError("Cannot add execution profiles when legacy parameters are set explicitly.")
         if name in self.profile_manager.profiles:
             raise ValueError("Profile %s already exists")
+        contact_points_but_no_lbp = (
+            self._contact_points_explicit and not
+            profile._load_balancing_policy_explicit)
+        if contact_points_but_no_lbp:
+            log.warning(
+                'Tried to add an ExecutionProfile with name {name}. '
+                '{self} was explicitly configured with contact_points, but '
+                '{ep} was not explicitly configured with a '
+                'load_balancing_policy. In the next major version, trying to '
+                'add an ExecutionProfile without an explicitly configured LBP '
+                'to a cluster with explicitly configured contact_points will '
+                'raise an exception; please specify a load-balancing policy '
+                'in the ExecutionProfile.'
+                ''.format(name=repr(name), self=self, ep=profile))
+
         self.profile_manager.profiles[name] = profile
         profile.load_balancing_policy.populate(self, self.metadata.all_hosts())
         # on_up after populate allows things like DCA LBP to choose default local dc
         for host in filter(lambda h: h.is_up, self.metadata.all_hosts()):
             profile.load_balancing_policy.on_up(host)
         futures = set()
-        for session in self.sessions:
+        for session in tuple(self.sessions):
             futures.update(session.update_created_pools())
         _, not_done = wait_futures(futures, pool_wait_timeout)
         if not_done:
@@ -1126,6 +1220,7 @@ class Cluster(object):
         kwargs_dict.setdefault('protocol_version', self.protocol_version)
         kwargs_dict.setdefault('user_type_map', self._user_types)
         kwargs_dict.setdefault('allow_beta_protocol_version', self.allow_beta_protocol_version)
+        kwargs_dict.setdefault('no_compact', self.no_compact)
 
         return kwargs_dict
 
@@ -1167,6 +1262,9 @@ class Cluster(object):
 
                 self.profile_manager.populate(
                     weakref.proxy(self), self.metadata.all_hosts())
+                self.load_balancing_policy.populate(
+                    weakref.proxy(self), self.metadata.all_hosts()
+                )
 
                 try:
                     self.control_connection.connect()
@@ -1187,7 +1285,11 @@ class Cluster(object):
                 self.profile_manager.check_supported()  # todo: rename this method
 
                 if self.idle_heartbeat_interval:
-                    self._idle_heartbeat = ConnectionHeartbeat(self.idle_heartbeat_interval, self.get_connection_holders)
+                    self._idle_heartbeat = ConnectionHeartbeat(
+                        self.idle_heartbeat_interval,
+                        self.get_connection_holders,
+                        timeout=self.idle_heartbeat_timeout
+                    )
                 self._is_setup = True
 
         session = self._new_session(keyspace)
@@ -1197,7 +1299,7 @@ class Cluster(object):
 
     def get_connection_holders(self):
         holders = []
-        for s in self.sessions:
+        for s in tuple(self.sessions):
             holders.extend(s.get_pools())
         holders.append(self.control_connection)
         return holders
@@ -1223,7 +1325,7 @@ class Cluster(object):
 
         self.control_connection.shutdown()
 
-        for session in self.sessions:
+        for session in tuple(self.sessions):
             session.shutdown()
 
         self.executor.shutdown()
@@ -1250,7 +1352,7 @@ class Cluster(object):
     def _cleanup_failed_on_up_handling(self, host):
         self.profile_manager.on_down(host)
         self.control_connection.on_down(host)
-        for session in self.sessions:
+        for session in tuple(self.sessions):
             session.remove_pool(host)
 
         self._start_reconnector(host, is_host_addition=False)
@@ -1289,7 +1391,7 @@ class Cluster(object):
                 host._currently_handling_node_up = False
 
         # see if there are any pools to add or remove now that the host is marked up
-        for session in self.sessions:
+        for session in tuple(self.sessions):
             session.update_created_pools()
 
     def on_up(self, host):
@@ -1326,7 +1428,7 @@ class Cluster(object):
                 self._prepare_all_queries(host)
                 log.debug("Done preparing all queries for host %s, ", host)
 
-            for session in self.sessions:
+            for session in tuple(self.sessions):
                 session.remove_pool(host)
 
             log.debug("Signalling to load balancing policies that host %s is up", host)
@@ -1339,7 +1441,7 @@ class Cluster(object):
             futures_lock = Lock()
             futures_results = []
             callback = partial(self._on_up_future_completed, host, futures, futures_results, futures_lock)
-            for session in self.sessions:
+            for session in tuple(self.sessions):
                 future = session.add_or_renew_pool(host, is_host_addition=False)
                 if future is not None:
                     have_future = True
@@ -1403,7 +1505,7 @@ class Cluster(object):
             # this is to avoid closing pools when a control connection host became isolated
             if self._discount_down_events and self.profile_manager.distance(host) != HostDistance.IGNORED:
                 connected = False
-                for session in self.sessions:
+                for session in tuple(self.sessions):
                     pool_states = session.get_pool_state()
                     pool_state = pool_states.get(host)
                     if pool_state:
@@ -1419,7 +1521,7 @@ class Cluster(object):
 
         self.profile_manager.on_down(host)
         self.control_connection.on_down(host)
-        for session in self.sessions:
+        for session in tuple(self.sessions):
             session.on_down(host)
 
         for listener in self.listeners:
@@ -1476,7 +1578,7 @@ class Cluster(object):
             self._finalize_add(host)
 
         have_future = False
-        for session in self.sessions:
+        for session in tuple(self.sessions):
             future = session.add_or_renew_pool(host, is_host_addition=True)
             if future is not None:
                 have_future = True
@@ -1494,7 +1596,7 @@ class Cluster(object):
             listener.on_add(host)
 
         # see if there are any pools to add or remove now that the host is marked up
-        for session in self.sessions:
+        for session in tuple(self.sessions):
             session.update_created_pools()
 
     def on_remove(self, host):
@@ -1504,7 +1606,7 @@ class Cluster(object):
         log.debug("Removing host %s", host)
         host.set_down()
         self.profile_manager.on_remove(host)
-        for session in self.sessions:
+        for session in tuple(self.sessions):
             session.on_remove(host)
         for listener in self.listeners:
             listener.on_remove(host)
@@ -1564,7 +1666,7 @@ class Cluster(object):
         If any host has fewer than the configured number of core connections
         open, attempt to open connections until that number is met.
         """
-        for session in self.sessions:
+        for session in tuple(self.sessions):
             for pool in tuple(session._pools.values()):
                 pool.ensure_core_connections()
 
@@ -1703,8 +1805,23 @@ class Cluster(object):
         Meta refresh must be enabled for the driver to become aware of any cluster
         topology changes or schema updates.
         """
+        warn("Cluster.set_meta_refresh_enabled is deprecated and will be removed in 4.0. Set "
+             "Cluster.schema_metadata_enabled and Cluster.token_metadata_enabled instead.", DeprecationWarning)
         self.schema_metadata_enabled = enabled
         self.token_metadata_enabled = enabled
+
+    @classmethod
+    def _send_chunks(cls, connection, host, chunks, set_keyspace=False):
+        for ks_chunk in chunks:
+            messages = [PrepareMessage(query=s.query_string,
+                                       keyspace=s.keyspace if set_keyspace else None)
+                        for s in ks_chunk]
+            # TODO: make this timeout configurable somehow?
+            responses = connection.wait_for_responses(*messages, timeout=5.0, fail_on_error=False)
+            for success, response in responses:
+                if not success:
+                    log.debug("Got unexpected response when preparing "
+                              "statement on host %s: %r", host, response)
 
     def _prepare_all_queries(self, host):
         if not self._prepared_statements or not self.reprepare_on_up:
@@ -1715,24 +1832,23 @@ class Cluster(object):
         try:
             connection = self.connection_factory(host.address)
             statements = self._prepared_statements.values()
-            for keyspace, ks_statements in groupby(statements, lambda s: s.keyspace):
-                if keyspace is not None:
-                    connection.set_keyspace_blocking(keyspace)
-
-                # prepare 10 statements at a time
-                ks_statements = list(ks_statements)
+            if ProtocolVersion.uses_keyspace_flag(self.protocol_version):
+                # V5 protocol and higher, no need to set the keyspace
                 chunks = []
-                for i in range(0, len(ks_statements), 10):
-                    chunks.append(ks_statements[i:i + 10])
+                for i in range(0, len(statements), 10):
+                    chunks.append(statements[i:i + 10])
+                    self._send_chunks(connection, host, chunks, True)
+            else:
+                for keyspace, ks_statements in groupby(statements, lambda s: s.keyspace):
+                    if keyspace is not None:
+                        connection.set_keyspace_blocking(keyspace)
 
-                for ks_chunk in chunks:
-                    messages = [PrepareMessage(query=s.query_string) for s in ks_chunk]
-                    # TODO: make this timeout configurable somehow?
-                    responses = connection.wait_for_responses(*messages, timeout=5.0, fail_on_error=False)
-                    for success, response in responses:
-                        if not success:
-                            log.debug("Got unexpected response when preparing "
-                                      "statement on host %s: %r", host, response)
+                    # prepare 10 statements at a time
+                    ks_statements = list(ks_statements)
+                    chunks = []
+                    for i in range(0, len(ks_statements), 10):
+                        chunks.append(ks_statements[i:i + 10])
+                    self._send_chunks(connection, host, chunks)
 
             log.debug("Done preparing all known prepared statements against host %s", host)
         except OperationTimedOut as timeout:
@@ -1900,7 +2016,7 @@ class Session(object):
     increasing timestamps across clusters, or set it to to ``lambda:
     int(time.time() * 1e6)`` if losing records over clock inconsistencies is
     acceptable for the application. Custom :attr:`timestamp_generator` s should
-    be callable, and calling them should return an integer representing seconds
+    be callable, and calling them should return an integer representing microseconds
     since some point in time, typically UNIX epoch.
 
     .. versionadded:: 3.8.0
@@ -2111,26 +2227,30 @@ class Session(object):
 
         if isinstance(query, SimpleStatement):
             query_string = query.query_string
+            statement_keyspace = query.keyspace if ProtocolVersion.uses_keyspace_flag(self._protocol_version) else None
             if parameters:
                 query_string = bind_params(query_string, parameters, self.encoder)
             message = QueryMessage(
                 query_string, cl, serial_cl,
-                fetch_size, timestamp=timestamp)
+                fetch_size, timestamp=timestamp,
+                keyspace=statement_keyspace)
         elif isinstance(query, BoundStatement):
             prepared_statement = query.prepared_statement
             message = ExecuteMessage(
                 prepared_statement.query_id, query.values, cl,
                 serial_cl, fetch_size,
-                timestamp=timestamp, skip_meta=bool(prepared_statement.result_metadata))
+                timestamp=timestamp, skip_meta=bool(prepared_statement.result_metadata),
+                result_metadata_id=prepared_statement.result_metadata_id)
         elif isinstance(query, BatchStatement):
             if self._protocol_version < 2:
                 raise UnsupportedOperation(
                     "BatchStatement execution is only supported with protocol version "
                     "2 or higher (supported in Cassandra 2.0 and higher).  Consider "
                     "setting Cluster.protocol_version to 2 to support this operation.")
+            statement_keyspace = query.keyspace if ProtocolVersion.uses_keyspace_flag(self._protocol_version) else None
             message = BatchMessage(
                 query.batch_type, query._statements_and_parameters, cl,
-                serial_cl, timestamp)
+                serial_cl, timestamp, statement_keyspace)
 
         message.tracing = trace
 
@@ -2199,7 +2319,7 @@ class Session(object):
         for fn, args, kwargs in self._request_init_callbacks:
             fn(response_future, *args, **kwargs)
 
-    def prepare(self, query, custom_payload=None):
+    def prepare(self, query, custom_payload=None, keyspace=None):
         """
         Prepares a query string, returning a :class:`~cassandra.query.PreparedStatement`
         instance which can be used as follows::
@@ -2222,24 +2342,36 @@ class Session(object):
             ...     bound = prepared.bind((user.id, user.name, user.age))
             ...     session.execute(bound)
 
+        Alternatively, if :attr:`~.Cluster.protocol_version` is 5 or higher
+        (requires Cassandra 4.0+), the keyspace can be specified as a
+        parameter. This will allow you to avoid specifying the keyspace in the
+        query without specifying a keyspace in :meth:`~.Cluster.connect`. It
+        even will let you prepare and use statements against a keyspace other
+        than the one originally specified on connection:
+
+            >>> analyticskeyspace_prepared = session.prepare(
+            ...     "INSERT INTO user_activity id, last_activity VALUES (?, ?)",
+            ...     keyspace="analyticskeyspace")  # note the different keyspace
+
         **Important**: PreparedStatements should be prepared only once.
         Preparing the same query more than once will likely affect performance.
 
         `custom_payload` is a key value map to be passed along with the prepare
         message. See :ref:`custom_payload`.
         """
-        message = PrepareMessage(query=query)
+        message = PrepareMessage(query=query, keyspace=keyspace)
         future = ResponseFuture(self, message, query=None, timeout=self.default_timeout)
         try:
             future.send_request()
-            query_id, bind_metadata, pk_indexes, result_metadata = future.result()
+            query_id, bind_metadata, pk_indexes, result_metadata, result_metadata_id = future.result()
         except Exception:
             log.exception("Error preparing query:")
             raise
 
+        prepared_keyspace = keyspace if keyspace else None
         prepared_statement = PreparedStatement.from_message(
             query_id, bind_metadata, pk_indexes, self.cluster.metadata, query, self.keyspace,
-            self._protocol_version, result_metadata)
+            self._protocol_version, result_metadata, result_metadata_id)
         prepared_statement.custom_payload = future.custom_payload
 
         self.cluster.add_prepared(query_id, prepared_statement)
@@ -2247,13 +2379,13 @@ class Session(object):
         if self.cluster.prepare_on_all_hosts:
             host = future._current_host
             try:
-                self.prepare_on_all_hosts(prepared_statement.query_string, host)
+                self.prepare_on_all_hosts(prepared_statement.query_string, host, prepared_keyspace)
             except Exception:
                 log.exception("Error preparing query on all hosts:")
 
         return prepared_statement
 
-    def prepare_on_all_hosts(self, query, excluded_host):
+    def prepare_on_all_hosts(self, query, excluded_host, keyspace=None):
         """
         Prepare the given query on all hosts, excluding ``excluded_host``.
         Intended for internal use only.
@@ -2261,7 +2393,8 @@ class Session(object):
         futures = []
         for host in tuple(self._pools.keys()):
             if host != excluded_host and host.is_up:
-                future = ResponseFuture(self, PrepareMessage(query=query), None, self.default_timeout)
+                future = ResponseFuture(self, PrepareMessage(query=query, keyspace=keyspace),
+                                            None, self.default_timeout)
 
                 # we don't care about errors preparing against specific hosts,
                 # since we can always prepare them as needed when the prepared
@@ -2312,6 +2445,15 @@ class Session(object):
 
     def __exit__(self, *args):
         self.shutdown()
+
+    def __del__(self):
+        try:
+            # Ensure all connections are closed, in case the Session object is deleted by the GC
+            self.shutdown()
+        except:
+            # Ignore all errors. Shutdown errors can be caught by the user
+            # when cluster.shutdown() is called explicitly.
+            pass
 
     def add_or_renew_pool(self, host, is_host_addition):
         """
@@ -2645,7 +2787,13 @@ class ControlConnection(object):
         a connection to that host.
         """
         errors = {}
-        for host in self._cluster._default_load_balancing_policy.make_query_plan():
+        lbp = (
+            self._cluster.load_balancing_policy
+            if self._cluster._config_mode == _ConfigMode.LEGACY else
+            self._cluster._default_load_balancing_policy
+        )
+
+        for host in lbp.make_query_plan():
             try:
                 return self._try_connect(host)
             except ConnectionException as exc:
@@ -3319,20 +3467,25 @@ class ResponseFuture(object):
         self.message = message
         self.query = query
         self.timeout = timeout
-        self._time_remaining = timeout
         self._retry_policy = retry_policy
         self._metrics = metrics
         self.prepared_statement = prepared_statement
         self._callback_lock = Lock()
         self._start_time = start_time or time.time()
+        self._spec_execution_plan = speculative_execution_plan or self._spec_execution_plan
         self._make_query_plan()
         self._event = Event()
         self._errors = {}
         self._callbacks = []
         self._errbacks = []
-        self._spec_execution_plan = speculative_execution_plan or self._spec_execution_plan
         self.attempted_hosts = []
         self._start_timer()
+
+    @property
+    def _time_remaining(self):
+        if self.timeout is None:
+            return None
+        return (self._start_time + self.timeout) - time.time()
 
     def _start_timer(self):
         if self._timer is None:
@@ -3348,11 +3501,43 @@ class ResponseFuture(object):
         if self._timer:
             self._timer.cancel()
 
-    def _on_timeout(self):
+    def _on_timeout(self, _attempts=0):
+        """
+        Called when the request associated with this ResponseFuture times out.
+
+        This function may reschedule itself. The ``_attempts`` parameter tracks
+        the number of times this has happened. This parameter should only be
+        set in those cases, where ``_on_timeout`` reschedules itself.
+        """
+        # PYTHON-853: for short timeouts, we sometimes race with our __init__
+        if self._connection is None and _attempts < 3:
+            self._timer = self.session.cluster.connection_class.create_timer(
+                0.01,
+                partial(self._on_timeout, _attempts=_attempts + 1)
+            )
+            return
+
+        if self._connection is not None:
+            try:
+                self._connection._requests.pop(self._req_id)
+            # This prevents the race condition of the
+            # event loop thread just receiving the waited message
+            # If it arrives after this, it will be ignored
+            except KeyError:
+                return
+
+            pool = self.session._pools.get(self._current_host)
+            if pool and not pool.is_shutdown:
+                with self._connection.lock:
+                    self._connection.request_ids.append(self._req_id)
+
+                pool.return_connection(self._connection)
+
         errors = self._errors
         if not errors:
             if self.is_schema_agreed:
-                errors = {self._current_host.address: "Client request timeout. See Session.execute[_async](timeout)"}
+                key = self._current_host.address if self._current_host else 'no host queried before timeout'
+                errors = {key: "Client request timeout. See Session.execute[_async](timeout)"}
             else:
                 connection = self.session.cluster.control_connection._connection
                 host = connection.host if connection else 'unknown'
@@ -3363,9 +3548,19 @@ class ResponseFuture(object):
     def _on_speculative_execute(self):
         self._timer = None
         if not self._event.is_set():
+
+            # PYTHON-836, the speculative queries must be after
+            # the query is sent from the main thread, otherwise the
+            # query from the main thread may raise NoHostAvailable
+            # if the _query_plan has been exhausted by the specualtive queries.
+            # This also prevents a race condition accessing the iterator.
+            # We reschedule this call until the main thread has succeeded
+            # making a query
+            if not self.attempted_hosts:
+                self._timer = self.session.cluster.connection_class.create_timer(0.01, self._on_speculative_execute)
+                return
+
             if self._time_remaining is not None:
-                elapsed = time.time() - self._start_time
-                self._time_remaining -= elapsed
                 if self._time_remaining <= 0:
                     self._on_timeout()
                     return
@@ -3614,7 +3809,8 @@ class ResponseFuture(object):
 
                     current_keyspace = self._connection.keyspace
                     prepared_keyspace = prepared_statement.keyspace
-                    if prepared_keyspace and current_keyspace != prepared_keyspace:
+                    if not ProtocolVersion.uses_keyspace_flag(self.session.cluster.protocol_version) \
+                            and prepared_keyspace  and current_keyspace != prepared_keyspace:
                         self._set_final_exception(
                             ValueError("The Session's current keyspace (%s) does "
                                        "not match the keyspace the statement was "
@@ -3624,7 +3820,10 @@ class ResponseFuture(object):
 
                     log.debug("Re-preparing unrecognized prepared statement against host %s: %s",
                               host, prepared_statement.query_string)
-                    prepare_message = PrepareMessage(query=prepared_statement.query_string)
+                    prepared_keyspace = prepared_statement.keyspace \
+                        if ProtocolVersion.uses_keyspace_flag(self.session.cluster.protocol_version) else None
+                    prepare_message = PrepareMessage(query=prepared_statement.query_string,
+                                                     keyspace=prepared_keyspace)
                     # since this might block, run on the executor to avoid hanging
                     # the event loop thread
                     self.session.submit(self._reprepare, prepare_message, host, connection, pool)
@@ -3691,9 +3890,14 @@ class ResponseFuture(object):
 
         if isinstance(response, ResultMessage):
             if response.kind == RESULT_KIND_PREPARED:
-                # result metadata is the only thing that could have changed from an alter
-                _, _, _, result_metadata = response.results
-                self.prepared_statement.result_metadata = result_metadata
+                if self.prepared_statement:
+                    # result metadata is the only thing that could have
+                    # changed from an alter
+                    (_, _, _,
+                     self.prepared_statement.result_metadata,
+                     new_metadata_id) = response.results
+                    if new_metadata_id is not None:
+                        self.prepared_statement.result_metadata_id = new_metadata_id
 
                 # use self._query to re-use the same host and
                 # at the same time properly borrow the connection

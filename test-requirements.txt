@@ -11,5 +11,6 @@ pure-sasl
 twisted
 gevent>=1.0
 eventlet
-cython>=0.20,<0.25
+cython>=0.20,<0.28
 packaging
+asynctest

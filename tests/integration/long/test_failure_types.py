@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys,logging, traceback, time
+import sys,logging, traceback, time, re
 
 from cassandra import (ConsistencyLevel, OperationTimedOut, ReadTimeout, WriteTimeout, ReadFailure, WriteFailure,
                        FunctionFailure, ProtocolVersion)
-from cassandra.cluster import Cluster, NoHostAvailable
+from cassandra.cluster import Cluster, NoHostAvailable, ExecutionProfile, EXEC_PROFILE_DEFAULT
+from cassandra.policies import HostFilterPolicy, RoundRobinPolicy
 from cassandra.concurrent import execute_concurrent_with_args
 from cassandra.query import SimpleStatement
-from tests.integration import use_singledc, PROTOCOL_VERSION, get_cluster, setup_keyspace, remove_cluster, get_node
+from tests.integration import use_singledc, PROTOCOL_VERSION, get_cluster, setup_keyspace, remove_cluster, get_node, \
+    requiresmallclockgranularity
 from mock import Mock
 
 try:
@@ -63,20 +65,12 @@ class ClientExceptionTests(unittest.TestCase):
         """
         Test is skipped if run with native protocol version <4
         """
-        self.support_v5 = True
         if PROTOCOL_VERSION < 4:
             raise unittest.SkipTest(
                 "Native protocol 4,0+ is required for custom payloads, currently using %r"
                 % (PROTOCOL_VERSION,))
-        try:
-            self.cluster = Cluster(protocol_version=ProtocolVersion.MAX_SUPPORTED, allow_beta_protocol_version=True)
-            self.session = self.cluster.connect()
-        except NoHostAvailable:
-            log.info("Protocol Version 5 not supported,")
-            self.cluster = Cluster(protocol_version=PROTOCOL_VERSION)
-            self.session = self.cluster.connect()
-            self.support_v5 = False
-
+        self.cluster = Cluster(protocol_version=PROTOCOL_VERSION)
+        self.session = self.cluster.connect()
         self.nodes_currently_failing = []
         self.node1, self.node2, self.node3 = get_cluster().nodes.values()
 
@@ -95,7 +89,7 @@ class ClientExceptionTests(unittest.TestCase):
                 return session.execute(query)
             except OperationTimedOut:
                 ex_type, ex, tb = sys.exc_info()
-                log.warn("{0}: {1} Backtrace: {2}".format(ex_type.__name__, ex, traceback.extract_tb(tb)))
+                log.warning("{0}: {1} Backtrace: {2}".format(ex_type.__name__, ex, traceback.extract_tb(tb)))
                 del tb
                 tries += 1
 
@@ -108,7 +102,7 @@ class ClientExceptionTests(unittest.TestCase):
                 return execute_concurrent_with_args(session, query, params, concurrency=50)
             except (ReadTimeout, WriteTimeout, OperationTimedOut, ReadFailure, WriteFailure):
                 ex_type, ex, tb = sys.exc_info()
-                log.warn("{0}: {1} Backtrace: {2}".format(ex_type.__name__, ex, traceback.extract_tb(tb)))
+                log.warning("{0}: {1} Backtrace: {2}".format(ex_type.__name__, ex, traceback.extract_tb(tb)))
                 del tb
                 tries += 1
 
@@ -134,7 +128,7 @@ class ClientExceptionTests(unittest.TestCase):
         # Ensure all nodes not on the list, but that are currently set to failing are enabled
         for node in self.nodes_currently_failing:
             if node not in failing_nodes:
-                node.stop(wait_other_notice=True, gently=False)
+                node.stop(wait_other_notice=True, gently=True)
                 node.start(wait_for_binary_proto=True, wait_other_notice=True)
                 self.nodes_currently_failing.remove(node)
 
@@ -155,10 +149,10 @@ class ClientExceptionTests(unittest.TestCase):
         else:
             with self.assertRaises(expected_exception) as cm:
                 self.execute_helper(session, statement)
-            if self.support_v5 and (isinstance(cm.exception, WriteFailure) or isinstance(cm.exception, ReadFailure)):
+            if ProtocolVersion.uses_error_code_map(PROTOCOL_VERSION):
                 if isinstance(cm.exception, ReadFailure):
                     self.assertEqual(list(cm.exception.error_code_map.values())[0], 1)
-                else:
+                if isinstance(cm.exception, WriteFailure):
                     self.assertEqual(list(cm.exception.error_code_map.values())[0], 0)
 
     def test_write_failures_from_coordinator(self):
@@ -317,6 +311,7 @@ class ClientExceptionTests(unittest.TestCase):
             """, consistency_level=ConsistencyLevel.ALL, expected_exception=None)
 
 
+@requiresmallclockgranularity
 class TimeoutTimerTest(unittest.TestCase):
     def setUp(self):
         """
@@ -324,22 +319,30 @@ class TimeoutTimerTest(unittest.TestCase):
         """
 
         # self.node1, self.node2, self.node3 = get_cluster().nodes.values()
-        self.node1 = get_node(1)
-        self.cluster = Cluster(protocol_version=PROTOCOL_VERSION)
-        self.session = self.cluster.connect()
+
+        node1 = ExecutionProfile(
+            load_balancing_policy=HostFilterPolicy(
+                RoundRobinPolicy(), lambda host: host.address == "127.0.0.1"
+            )
+        )
+        self.cluster = Cluster(protocol_version=PROTOCOL_VERSION, execution_profiles={EXEC_PROFILE_DEFAULT: node1})
+        self.session = self.cluster.connect(wait_for_all_pools=True)
+
+        self.control_connection_host_number = 1
+        self.node_to_stop = get_node(self.control_connection_host_number)
 
         ddl = '''
             CREATE TABLE test3rf.timeout (
                 k int PRIMARY KEY,
                 v int )'''
         self.session.execute(ddl)
-        self.node1.pause()
+        self.node_to_stop.pause()
 
     def tearDown(self):
         """
         Shutdown cluster and resume node1
         """
-        self.node1.resume()
+        self.node_to_stop.resume()
         self.session.execute("DROP TABLE test3rf.timeout")
         self.cluster.shutdown()
 

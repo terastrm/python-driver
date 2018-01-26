@@ -1,4 +1,4 @@
-# Copyright 2013-2017 DataStax, Inc.
+# Copyright DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1281,6 +1281,15 @@ class TestModelQueryWithDBField(BaseCassEngTestCase):
         for value in values:
             self.assertTrue(value not in str(b2.queries[0]))
 
+    def test_db_field_value_list(self):
+        DBFieldModel.create(k0=0, k1=0, c0=0, v0=4, v1=5)
+
+        self.assertEqual(DBFieldModel.objects.filter(c0=0, k0=0, k1=0).values_list('c0', 'v0')._defer_fields,
+                         {'a', 'c', 'b'})
+        self.assertEqual(DBFieldModel.objects.filter(c0=0, k0=0, k1=0).values_list('c0', 'v0')._only_fields,
+                         ['c', 'd'])
+
+        list(DBFieldModel.objects.filter(c0=0, k0=0, k1=0).values_list('c0', 'v0'))
 
 class TestModelSmall(Model):
 
